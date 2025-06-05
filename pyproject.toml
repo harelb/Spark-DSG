@@ -14,6 +14,7 @@ dependencies = [
     "numpy",
     "shapely",
     "zmq",
+    "viser",
 ]
 authors = [
   {name ="Nathan Hughes", email = "na26933@mit.edu"},
