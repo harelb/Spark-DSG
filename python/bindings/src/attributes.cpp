@@ -144,7 +144,8 @@ void init_attributes(py::module_& m) {
       .def_readonly("trajectory_timestamps", &KhronosObjectAttributes::trajectory_timestamps)
       .def_readonly("trajectory_positions", &KhronosObjectAttributes::trajectory_positions)
       .def_readonly("dynamic_object_points", &KhronosObjectAttributes::dynamic_object_points)
-      .def_readonly("details", &KhronosObjectAttributes::details);
+      .def_readonly("details", &KhronosObjectAttributes::details)
+      .def_readwrite("image_folder", &KhronosObjectAttributes::image_folder);
 
   py::class_<RoomNodeAttributes, SemanticNodeAttributes>(m, "RoomNodeAttributes")
       .def(py::init<>())

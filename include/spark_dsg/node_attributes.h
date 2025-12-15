@@ -424,6 +424,9 @@ struct KhronosObjectAttributes : public ObjectNodeAttributes {
   // Optionally store additional detailed infos if needed.
   std::map<std::string, std::vector<size_t>> details;
 
+  // Folder where images for this object are stored (relative to dsg).
+  std::string image_folder;
+
  protected:
   std::ostream& fill_ostream(std::ostream& out) const override;
   void serialization_info() override;
