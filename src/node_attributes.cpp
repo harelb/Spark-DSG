@@ -554,6 +554,7 @@ std::ostream& KhronosObjectAttributes::fill_ostream(std::ostream& out) const {
   }
   out << "\n  - mesh: " << mesh.numVertices() << " vertices, " << mesh.numFaces()
       << " faces";
+  out << "\n  - image_folder: " << image_folder;
   return out;
 }
 
@@ -565,6 +566,7 @@ void KhronosObjectAttributes::serialization_info() {
   serialization::field("trajectory_timestamps", trajectory_timestamps);
   serialization::field("dynamic_object_points", dynamic_object_points);
   serialization::field("details", details);
+  serialization::field("image_folder", image_folder);
 
   const auto& header = io::GlobalInfo::loadedHeader();
   if (header.version <= io::Version(1, 0, 1)) {
@@ -616,7 +618,7 @@ bool KhronosObjectAttributes::is_equal(const NodeAttributes& other) const {
          last_observed_ns == derived->last_observed_ns && mesh == derived->mesh &&
          trajectory_positions == derived->trajectory_positions &&
          dynamic_object_points == derived->dynamic_object_points &&
-         details == derived->details;
+         details == derived->details && image_folder == derived->image_folder;
 }
 
 bool BoundaryInfo::operator==(const BoundaryInfo& other) const {
