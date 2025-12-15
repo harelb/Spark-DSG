@@ -1,12 +1,12 @@
-cmake_minimum_required(VERSION 3.16)
-project(spark_dsg VERSION 1.1.2)
+cmake_minimum_required(VERSION 3.22)
+project(spark_dsg VERSION 1.1.3)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra)
+  add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -103,6 +103,7 @@ add_library(
   src/scene_graph_node.cpp
   src/scene_graph_types.cpp
   src/scene_graph_utilities.cpp
+  src/traversability_boundary.cpp
   src/zmq_interface.cpp
   src/serialization/attribute_serialization.cpp
   src/serialization/binary_conversions.cpp

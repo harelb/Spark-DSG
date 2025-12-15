@@ -32,66 +32,44 @@
 # purposes notwithstanding any copyright notation herein.
 #
 #
-"""Conversion from spark_dsg to networkx."""
+"""Test that the bindings are working appropriately."""
 
-import importlib
-import warnings
-
-
-def _get_networkx():
-    networkx = None
-    try:
-        networkx = importlib.import_module("networkx")
-    except ImportError:
-        warnings.warn("Coud not find networkx! Conversion disabled!")
-
-    return networkx
+import numpy as np
+import spark_dsg as dsg
 
 
-def _convert_attr(attrs):
-    valid_fields = [x for x in dir(attrs) if x[0] != "_"]
-    return {x: getattr(attrs, x) for x in valid_fields}
+def test_mesh_erase_vertices():
+    """Test that place attributes work correctly."""
+    mesh = dsg.Mesh()
+    mesh.resize_vertices(12)
+    for i in range(12):
+        mesh.set_pos(i, (i, i, i))
+        mesh.set_timestamp(i, i)
+    faces = np.array(
+        [
+            [0, 1, 2],
+            [2, 3, 4],
+            [4, 5, 6],
+            [6, 7, 8],
+            [8, 9, 10],
+            [10, 11, 0],
+        ]
+    )
+    mesh.set_faces(faces.transpose())
+
+    assert mesh.num_vertices() == 12
+    assert mesh.num_faces() == 6
+
+    mesh.erase_faces({0, 1}, True)
+
+    assert mesh.num_vertices() == 9
+    assert mesh.num_faces() == 4
+
+    mesh.erase_vertices({0, 1, 2, 3})
+
+    assert mesh.num_vertices() == 5
+    assert mesh.num_faces() == 1
 
 
-def _fill_from_layer(G_out, layer):
-    for node in layer.nodes:
-        G_out.add_node(node.id.value, **_convert_attr(node.attributes))
-
-    for edge in layer.edges:
-        G_out.add_edge(edge.source, edge.target, **_convert_attr(edge.info))
-
-
-def graph_to_networkx(G_in, include_partitions=True):
-    """Convert the DSG to a networkx representation."""
-    nx = _get_networkx()
-    if nx is None:
-        return None
-
-    G_out = nx.Graph()
-    for layer in G_in.layers:
-        _fill_from_layer(G_out, layer)
-
-    if include_partitions:
-        for layer in G_in.layer_partitions:
-            _fill_from_layer(G_out, layer)
-
-    for edge in G_in.interlayer_edges:
-        if edge.source not in G_out or edge.target not in G_out:
-            # skip adding edges that involve nodes in partitions if they're not
-            # included in the conversion
-            continue
-
-        G_out.add_edge(edge.source, edge.target, **_convert_attr(edge.info))
-
-    return G_out
-
-
-def layer_to_networkx(G_in):
-    """Convert the DSG to a networkx representation."""
-    nx = _get_networkx()
-    if nx is None:
-        return None
-
-    G_out = nx.Graph()
-    _fill_from_layer(G_out, G_in)
-    return G_out
+if __name__ == "__main__":
+    test_mesh_erase_vertices()

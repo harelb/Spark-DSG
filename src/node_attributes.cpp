@@ -193,16 +193,20 @@ void SemanticNodeAttributes::serialization_info() {
   serialization::field("name", name);
   const auto& header = io::GlobalInfo::loadedHeader();
   if (header.version <= io::Version(1, 0, 2)) {
+    io::warnOutdatedHeader(header);
+
     Eigen::Matrix<uint8_t, 3, 1> color_uint8;
     serialization::field("color", color_uint8);
     color = Color(color_uint8[0], color_uint8[1], color_uint8[2]);
-    io::warnOutdatedHeader(header);
   } else {
     serialization::field("color", color);
   }
+
   serialization::field("bounding_box", bounding_box);
   serialization::field("semantic_label", semantic_label);
   if (header.version <= io::Version(1, 0, 4)) {
+    io::warnOutdatedHeader(header);
+
     Eigen::MatrixXd feature;
     serialization::field("semantic_feature", feature);
     semantic_feature = feature.cast<float>();
@@ -324,6 +328,7 @@ std::ostream& PlaceNodeAttributes::fill_ostream(std::ostream& out) const {
   out << std::boolalpha << "\n  - real place: " << real_place;
   out << std::boolalpha << "\n  - need cleanup: " << need_cleanup;
   out << std::boolalpha << "\n  - active frontier: " << active_frontier;
+  out << std::boolalpha << "\n  - anti frontier: " << active_frontier;
   out << "\n  - num frontier voxels: " << num_frontier_voxels;
   return out;
 }
@@ -342,6 +347,12 @@ void PlaceNodeAttributes::serialization_info() {
   serialization::field("orientation", orientation);
   serialization::field("need_cleanup", need_cleanup);
   serialization::field("num_frontier_voxels", num_frontier_voxels);
+  const auto& header = io::GlobalInfo::loadedHeader();
+  if (header.version < io::Version(1, 1, 3)) {
+    io::warnOutdatedHeader(header);
+  } else {
+    serialization::field("anti_frontier", anti_frontier);
+  }
 }
 
 bool PlaceNodeAttributes::is_equal(const NodeAttributes& other) const {
@@ -362,6 +373,7 @@ bool PlaceNodeAttributes::is_equal(const NodeAttributes& other) const {
          deformation_connections == derived->deformation_connections &&
          real_place == derived->real_place &&
          active_frontier == derived->active_frontier &&
+         anti_frontier == derived->anti_frontier &&
          frontier_scale == derived->frontier_scale &&
          quaternionsEqual(orientation, derived->orientation) &&
          need_cleanup == derived->need_cleanup &&
@@ -458,10 +470,10 @@ void AgentNodeAttributes::serialization_info() {
   NodeAttributes::serialization_info();
 
   const auto& header = io::GlobalInfo::loadedHeader();
-  if (header.version >= io::Version(1, 1, 0)) {
-    serialization::field("timestamp", timestamp);
-  } else {
+  if (header.version < io::Version(1, 1, 0)) {
     io::warnOutdatedHeader(header);
+  } else {
+    serialization::field("timestamp", timestamp);
   }
 
   serialization::field("world_R_body", world_R_body);
@@ -486,7 +498,7 @@ bool AgentNodeAttributes::is_equal(const NodeAttributes& other) const {
          dbow_values == derived->dbow_values;
 }
 
-KhronosObjectAttributes::KhronosObjectAttributes() : mesh(true, false, false){};
+KhronosObjectAttributes::KhronosObjectAttributes() : mesh(true, false, false) {}
 
 NodeAttributes::Ptr KhronosObjectAttributes::clone() const {
   return std::make_unique<KhronosObjectAttributes>(*this);
@@ -519,6 +531,7 @@ void KhronosObjectAttributes::serialization_info() {
   const auto& header = io::GlobalInfo::loadedHeader();
   if (header.version <= io::Version(1, 0, 1)) {
     io::warnOutdatedHeader(header);
+
     std::vector<float> xyz;
     serialization::field("vertices", xyz);
     std::vector<uint8_t> rgb;
@@ -566,6 +579,62 @@ bool KhronosObjectAttributes::is_equal(const NodeAttributes& other) const {
          trajectory_positions == derived->trajectory_positions &&
          dynamic_object_points == derived->dynamic_object_points &&
          details == derived->details;
+}
+
+bool BoundaryInfo::operator==(const BoundaryInfo& other) const {
+  return min == other.min && max == other.max && states == other.states;
+}
+
+NodeAttributes::Ptr TraversabilityNodeAttributes::clone() const {
+  return std::make_unique<TraversabilityNodeAttributes>(*this);
+}
+
+std::ostream& TraversabilityNodeAttributes::fill_ostream(std::ostream& out) const {
+  NodeAttributes::fill_ostream(out);
+  out << "  - min: " << boundary.min.transpose() << "\n"
+      << "  - max: " << boundary.max.transpose() << "\n"
+      << "  - first_observed_ns: " << first_observed_ns << "\n"
+      << "  - last_observed_ns: " << last_observed_ns << "\n"
+      << "  - distance: " << distance << "\n";
+  return out;
+}
+
+void TraversabilityNodeAttributes::serialization_info() {
+  NodeAttributes::serialization_info();
+  serialization::field("first_observed_ns", first_observed_ns);
+  serialization::field("last_observed_ns", last_observed_ns);
+  serialization::field("distance", distance);
+  serialization::field("min", boundary.min);
+  serialization::field("max", boundary.max);
+  // Workaround for state serialization.
+  for (size_t i = 0; i < 4; ++i) {
+    std::vector<uint8_t> s;
+    s.reserve(boundary.states[i].size());
+    for (const auto& state : boundary.states[i]) {
+      s.push_back(static_cast<uint8_t>(state));
+    }
+    serialization::field("states_" + std::to_string(i), s);
+    boundary.states[i].clear();
+    boundary.states[i].reserve(s.size());
+    for (const auto& state : s) {
+      boundary.states[i].push_back(static_cast<TraversabilityState>(state));
+    }
+  }
+}
+
+bool TraversabilityNodeAttributes::is_equal(const NodeAttributes& other) const {
+  const auto derived = dynamic_cast<const TraversabilityNodeAttributes*>(&other);
+  if (!derived) {
+    return false;
+  }
+
+  if (!NodeAttributes::is_equal(other)) {
+    return false;
+  }
+
+  return boundary == derived->boundary && distance == derived->distance &&
+         first_observed_ns == derived->first_observed_ns &&
+         last_observed_ns == derived->last_observed_ns;
 }
 
 }  // namespace spark_dsg

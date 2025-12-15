@@ -160,6 +160,7 @@ void init_attributes(py::module_& m) {
       .def_readwrite("deformation_connections", &PlaceNodeAttributes::deformation_connections)
       .def_readwrite("real_place", &PlaceNodeAttributes::real_place)
       .def_readwrite("active_frontier", &PlaceNodeAttributes::active_frontier)
+      .def_readwrite("anti_frontier", &PlaceNodeAttributes::anti_frontier)
       .def_readwrite("frontier_scale", &PlaceNodeAttributes::frontier_scale)
       .def_property(
           "orientation",
@@ -179,6 +180,25 @@ void init_attributes(py::module_& m) {
       .def_readwrite("pcl_mesh_connections", &Place2dNodeAttributes::pcl_mesh_connections)
       .def_readwrite("mesh_vertex_labels", &Place2dNodeAttributes::mesh_vertex_labels)
       .def_readwrite("deformation_connections", &Place2dNodeAttributes::deformation_connections);
+
+  py::class_<BoundaryInfo>(m, "BoundaryInfo")
+      .def(py::init<>())
+      .def_readwrite("min", &BoundaryInfo::min)
+      .def_readwrite("max", &BoundaryInfo::max)
+      .def_readwrite("states", &BoundaryInfo::states);
+
+  py::enum_<TraversabilityState>(m, "TraversabilityState")
+      .value("UNKNOWN", TraversabilityState::UNKNOWN)
+      .value("TRAVERSABLE", TraversabilityState::TRAVERSABLE)
+      .value("INTRAVERSABLE", TraversabilityState::INTRAVERSABLE)
+      .value("TRAVERSED", TraversabilityState::TRAVERSED);
+
+  py::class_<TraversabilityNodeAttributes, NodeAttributes>(m, "TraversabilityNodeAttributes")
+      .def(py::init<>())
+      .def_readwrite("boundary", &TraversabilityNodeAttributes::boundary)
+      .def_readwrite("first_observed_ns", &TraversabilityNodeAttributes::first_observed_ns)
+      .def_readwrite("last_observed_ns", &TraversabilityNodeAttributes::last_observed_ns)
+      .def_readwrite("distance", &TraversabilityNodeAttributes::distance);
 
   py::class_<AgentNodeAttributes, NodeAttributes>(m, "AgentNodeAttributes")
       .def(py::init<>())
