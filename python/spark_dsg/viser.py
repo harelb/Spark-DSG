@@ -1010,8 +1010,12 @@ class LayerHandle:
 
         self._nodes = None
         self._edges = None
-        self._bbox_lines = []
-        self._bbox_hitboxes = []
+        self._nodes = None
+        self._edges = None
+        self._bbox_lines_handle = None
+        self._bbox_hitbox_handle = None
+        self._bbox_id_map = [] # List of nodes corresponding to batched indices
+
         self._label_info = []
         self._label_handles = []
         pos = view.pos(layer.key, height)
@@ -1116,142 +1120,131 @@ class LayerHandle:
             ]
             
         # Toggle BBoxes visibility
-        for bbox_handle in self._bbox_lines:
-            bbox_handle.visible = draw_bboxes
-        for hitbox in self._bbox_hitboxes:
-            # Hitbox is invisible (opacity=0) but its SceneNode visible toggle must be true to exist
-            hitbox.visible = draw_bboxes
+        if self._bbox_lines_handle:
+             self._bbox_lines_handle.visible = draw_bboxes
+        if self._bbox_hitbox_handle:
+             self._bbox_hitbox_handle.visible = draw_bboxes
 
 
         self._parent_callback()
 
     def _update_bboxes(self, G, layer):
         # Clear existing
-        for h in self._bbox_lines:
-            h.remove()
-        self._bbox_lines = []
+        if self._bbox_lines_handle:
+            self._bbox_lines_handle.remove()
+            self._bbox_lines_handle = None
+            
+        if self._bbox_hitbox_handle:
+            self._bbox_hitbox_handle.remove()
+            self._bbox_hitbox_handle = None
+            
+        self._bbox_id_map = []
         
+        # Arrays for batching
+        all_segments = []
+        all_colors = []
+        
+        hitbox_positions = []
+        hitbox_wxyzs = []
+        hitbox_scales = []
+        
+        # Standard unit cube wireframe edges (0..1)
+        # However, we get absolute corners from C++. 
+        # So we just accumulate segments.
+        
+        # spark_dsg bitwise corner ordering edges
+        edges_bitwise = [
+            (0, 1), (0, 2), (0, 4),
+            (1, 3), (1, 5),
+            (2, 3), (2, 6),
+            (3, 7),
+            (4, 5), (4, 6),
+            (5, 7),
+            (6, 7)
+        ]
+
         for node in layer.nodes:
             if hasattr(node.attributes, "bounding_box"):
                 bbox = node.attributes.bounding_box
-                # Check for validity?
-                # Draw plain box
-                # BoundingBox from bindings might have min/max/world_P_center/dimensions
-                # Let's try to get corners.
-                # Bindings: .corners() -> numpy array? or list of vectors?
-                # From scene_graph.cpp: .def("corners", &BoundingBox::corners)
-                # It returns Eigen::Matrix<float, 3, 8> probably. 
-                # Actually usually vectors.
-                
                 if not bbox.is_valid():
                     continue
 
                 try:
-                    # Bindings return a list of numpy arrays
+                    # --- Wireframe Data ---
                     c_list = bbox.corners()
-                    corners = np.array(c_list) # Should be (8, 3)
+                    corners = np.array(c_list) 
                     
                     if corners.shape == (8, 3):
-                        # Viser expects lines as simple segments pairs
-                        # BBox wireframe edges (indices into the 8 corners)
-                        # Standard order for AABB usually: 
-                        # 0: min
-                        # 7: max
-                        # It depends on how spark_dsg orders them. 
-                        # Assuming standard 0-7 labeling or similar.
-                        # Let's try all edges for a cube.
-                        # 0-1, 0-2, 0-4
-                        # 1-3, 1-5
-                        # 2-3, 2-6
-                        # 3-7
-                        # 4-5, 4-6
-                        # 5-7
-                        # 6-7
-                        # This works if corners are ordered bitwise (x,y,z): 000, 001, 010...
-                        
-                        # However, let's just trace all 12 edges based on bit permutations if unsure, 
-                        # OR just use the previous standard list which is robust for linear ordering if consistent.
-                        # Previous list:
-                        # (0, 1), (1, 2), (2, 3), (3, 0) -> bottom face?
-                        # (4, 5), (5, 6), (6, 7), (7, 4) -> top face?
-                        # (0, 4), (1, 5), (2, 6), (3, 7) -> vertical connectors
-                        
-                        edges = [
-                            (0, 1), (1, 3), (3, 2), (2, 0),
-                            (4, 5), (5, 7), (7, 6), (6, 4),
-                            (0, 4), (1, 5), (2, 6), (3, 7)
-                        ]
-                        # Wait, spark_dsg bitwise order:
-                        # 0: ---
-                        # 1: --+
-                        # 2: -+-
-                        # 3: -++
-                        # ...
-                        # If that's the case:
-                        # 0 connects to 1(z), 2(y), 4(x)
-                        # 1 connects to 0, 3(y), 5(x)
-                        # 2 connects to 0, 3(z), 6(x)
-                        # 3 connects to 1, 2, 7(x)
-                        # 4 connects to 0, 5(z), 6(y)
-                        # 5 connects to 1, 4, 7(y)
-                        # 6 connects to 2, 4, 7(z)
-                        # 7 connects to 3, 5, 6
-                        
-                        edges_bitwise = [
-                            (0, 1), (0, 2), (0, 4),
-                            (1, 3), (1, 5),
-                            (2, 3), (2, 6),
-                            (3, 7),
-                            (4, 5), (4, 6),
-                            (5, 7),
-                            (6, 7)
-                        ]
-
-                        segments = []
-                        # Use the bitwise edges as they are most likely for generated corners
+                        # Add segments
                         for start, end in edges_bitwise:
-                            segments.append(corners[start])
-                            segments.append(corners[end])
+                            all_segments.append(corners[start])
+                            all_segments.append(corners[end])
+                            
+                        # Color
+                        c = dsg.distinct_150_color(node.attributes.semantic_label).to_float_array() if hasattr(node.attributes, "semantic_label") else (1.0, 0.0, 0.0)
+                        c_arr = np.array(c)
                         
-                        segments = np.array(segments).reshape(-1, 2, 3)
-                        
-                        color = dsg.distinct_150_color(node.attributes.semantic_label).to_float_array() if hasattr(node.attributes, "semantic_label") else (1.0, 0.0, 0.0)
+                        # We need (12, 2, 3) for the 12 segments, 2 vertices each
+                        # Expand c to (1, 1, 3) then tile
+                        box_colors = np.tile(c_arr.reshape(1, 1, 3), (12, 2, 1))
+                        all_colors.append(box_colors)
 
-                        line_handle = self._server.scene.add_line_segments(
-                            f"{self.name}_bbox_{node.id}",
-                            segments,
-                            color, 
-                            line_width=2.0
-                        )
-                        self._bbox_lines.append(line_handle)
-                        
-                        # Create Frame/Hitbox (Transparent Mesh)
-                        # We use a box mesh with alpha=0 (or 0.01) to capture clicks
-                        # Create Hitbox using add_box for better transparency support
-                        dim = np.array(bbox.dimensions)
-                        center = np.array(bbox.world_P_center)
-                        R = np.array(bbox.world_R_center)
-                        wxyz = vtf.SO3.from_matrix(R).wxyz
-                        
-                        hitbox_handle = self._server.scene.add_box(
-                             f"{self.name}_hitbox_{node.id}",
-                             position=center,
-                             dimensions=dim,
-                             wxyz=wxyz,
-                             color=(0, 0, 0),
-                             opacity=0.0, # Invisible but clickable
-                        )
-                        hitbox_handle.on_click(lambda _, n=node: self._on_node_click(n))
-                        self._bbox_hitboxes.append(hitbox_handle)
+                    # --- Hitbox Data ---
+                    dim = np.array(bbox.dimensions)
+                    center = np.array(bbox.world_P_center)
+                    R = np.array(bbox.world_R_center)
+                    
+                    hitbox_positions.append(center)
+                    hitbox_wxyzs.append(vtf.SO3.from_matrix(R).wxyz)
+                    hitbox_scales.append(dim)
+                    
+                    self._bbox_id_map.append(node)
 
                 except Exception as e:
-                     # Fallback if corners() fails or shape is weird
-                     print(f"Error drawing bbox for {node.id}: {e}")
-                     pass
+                     print(f"Error preparing bbox batch for {node.id}: {e}")
+                     continue
 
-    def _on_node_click(self, node):
-        if self._object_manager:
-            self._object_manager.handle_click(node)
+        # create Batched Wireframes
+        if all_segments:
+            # Reshape to (N, 2, 3) as required by add_line_segments
+            points = np.array(all_segments).reshape(-1, 2, 3)
+            
+            # Colors
+            if all_colors:
+                colors = np.concatenate(all_colors, axis=0) # (N, 2, 3)
+            else:
+                colors = (1.0, 0.0, 0.0)
+                
+            self._bbox_lines_handle = self._server.scene.add_line_segments(
+                f"{self.name}_bbox_lines",
+                points,
+                colors, 
+                line_width=2.0
+            )
+
+        # Create Batched Hitboxes
+            mesh = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+            
+            self._bbox_hitbox_handle = self._server.scene.add_batched_meshes_simple(
+                f"{self.name}_hitboxes",
+                vertices=mesh.vertices,
+                faces=mesh.faces,
+                batched_positions=np.array(hitbox_positions),
+                batched_wxyzs=np.array(hitbox_wxyzs),
+                batched_scales=np.array(hitbox_scales),
+                opacity=0.0,
+            )
+            
+            self._bbox_hitbox_handle.on_click(self._on_batched_click)
+
+
+    def _on_batched_click(self, event):
+        # event.instance_index contains the index of the clicked instance
+        idx = event.instance_index
+        if idx is not None and 0 <= idx < len(self._bbox_id_map):
+            node = self._bbox_id_map[idx]
+            if self._object_manager:
+                self._object_manager.handle_click(node)
 
 
     def remove(self):
@@ -1269,11 +1262,10 @@ class LayerHandle:
         self._draw_edges.remove()
         self._node_scale.remove()
         self._edge_scale.remove()
-        self._draw_bboxes.remove()
-        for x in self._bbox_lines:
-            x.remove()
-        for x in self._bbox_hitboxes:
-            x.remove()
+        if self._bbox_lines_handle:
+            self._bbox_lines_handle.remove()
+        if self._bbox_hitbox_handle:
+            self._bbox_hitbox_handle.remove()
         self._folder.remove()
 
 
