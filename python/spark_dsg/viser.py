@@ -9,9 +9,12 @@ import numpy as np
 import trimesh
 import viser
 import viser.transforms as vtf
-import json
 import io
+import json
 import logging
+import base64
+import time
+import threading
 from pathlib import Path
 from PIL import Image, ImageDraw
 
@@ -146,6 +149,15 @@ class ObjectManager:
         # Create image container first so it appears at the top
         self._image_container = server.gui.add_folder("Selected Image")
 
+        # Hacks for wider modals
+        # Viser uses Mantine UI. We can inject global styles via markdown.
+        server.gui.add_markdown(
+            "<style>"
+            ".mantine-Modal-content { max-width: 95vw !important; width: auto !important; }"
+            ".mantine-Modal-inner { width: 100% !important; padding-left: 0 !important; padding-right: 0 !important; }"
+            "</style>"
+        )
+
         self._folder = server.gui.add_folder("Object Browser")
         with self._folder:
             self._object_dropdown = server.gui.add_dropdown(
@@ -156,6 +168,7 @@ class ObjectManager:
             self._jump_button = server.gui.add_button("Jump to Object")
             self._toggle_mesh = server.gui.add_checkbox("Show Object Mesh", initial_value=True)
             self._toggle_bbox_2d = server.gui.add_checkbox("Show 2D BBox", initial_value=True)
+            self._show_mask = server.gui.add_checkbox("Show Mask", initial_value=False)
             self._show_3d_image = server.gui.add_checkbox("Show 3D Image", initial_value=True)
             self._maximize_2d = server.gui.add_checkbox("Maximize 2D Image", initial_value=False)
             
@@ -163,9 +176,25 @@ class ObjectManager:
             self._image_handle_3d = None
             self._image_label_3d = None
             self._mesh_handle = None
+            
+            # Gallery Controls
+            self._image_slider = server.gui.add_slider(
+                "Frame Index", min=0, max=1, step=1, initial_value=0, visible=False
+            )
+            self._maximize_btn = server.gui.add_button("Fullscreen Image", icon=viser.Icon.ZOOM_IN, visible=False)
+            
+            # Playback Controls placed in a row
+            with server.gui.add_folder("Playback Controls", visible=False) as self._playback_folder:
+                 self._play_button = server.gui.add_button("Play", icon=viser.Icon.PLAYER_PLAY)
+                 self._pause_button = server.gui.add_button("Pause", icon=viser.Icon.PLAYER_PAUSE, visible=False)
+                 self._fps_number = server.gui.add_number("FPS", initial_value=10.0, min=1.0, max=60.0)
 
         self._current_node = None
         self._node_map = {} # label -> node_id
+        self._current_images = [] # List of (image_path, meta_path, mask_path)
+        self._current_img_array = None # Cache for modal
+        self._playing = False
+        self._playback_thread = None
         
         # Populate dropdown
         self._update_dropdown()
@@ -175,8 +204,18 @@ class ObjectManager:
         self._jump_button.on_click(self._on_jump)
         self._toggle_mesh.on_update(self._on_view_update)
         self._toggle_bbox_2d.on_update(self._on_view_update)
+        self._show_mask.on_update(self._on_view_update)
         self._show_3d_image.on_update(self._on_view_update)
         self._maximize_2d.on_update(self._on_view_update)
+        
+        self._image_slider.on_update(self._on_slider_update)
+        self._maximize_btn.on_click(self._on_maximize_click)
+        self._play_button.on_click(self._on_play)
+        self._pause_button.on_click(self._on_pause)
+
+        # Start playback thread
+        self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
+        self._playback_thread.start()
 
         if self._image_root:
             print(f"ObjectManager initialized with image_root: {self._image_root}")
@@ -222,11 +261,148 @@ class ObjectManager:
             self._current_node = node
             self._update_selection()
 
+    def _playback_loop(self):
+        while True:
+            if self._playing and self._current_images:
+                try:
+                    current_idx = self._image_slider.value
+                    max_idx = len(self._current_images) - 1
+                    
+                    if max_idx > 0:
+                        next_idx = (current_idx + 1) % (max_idx + 1)
+                        self._image_slider.value = next_idx
+                        
+                    sleep_time = 1.0 / self._fps_number.value
+                    time.sleep(sleep_time)
+                except Exception as e:
+                    print(f"Playback error: {e}")
+                    self._playing = False
+            else:
+                time.sleep(0.1)
+
+    def _on_slider_update(self, event):
+        # Only update if image changed
+        if not self._current_node:
+             return
+        self._update_image()
+
+    def _on_play(self, event):
+        self._playing = True
+        self._play_button.visible = False
+        self._pause_button.visible = True
+
+    def _on_pause(self, event):
+        self._playing = False
+        self._play_button.visible = True
+        self._pause_button.visible = False
+
+    def _on_maximize_click(self, event):
+            # Helper to update image based on zoom/pan/frame
+            def _update_view():
+                if not self._current_images:
+                     return
+                
+                # Get current raw image (re-read or cache?)
+                # We cache _current_img_array but that is for the SIDE PANEL (potentially with bbox/mask burned in?)
+                # Actually _update_image updates _current_img_array with the *final* 2D image (mask+bbox).
+                # So we can use it.
+                
+                # But wait, if we change frame via slider in modal, _current_img_array updates?
+                # Yes, because we link sliders.
+                
+                # Crop logic
+                pil_img = Image.fromarray(self._current_img_array)
+                w, h = pil_img.size
+                
+                zoom = self._modal_zoom.value
+                center_x = w / 2 * (1 + self._modal_pan_x.value)
+                center_y = h / 2 * (1 + self._modal_pan_y.value)
+                
+                crop_w = w / zoom
+                crop_h = h / zoom
+                
+                left = center_x - crop_w / 2
+                top = center_y - crop_h / 2
+                right = center_x + crop_w / 2
+                bottom = center_y + crop_h / 2
+                
+                # Clamping? PIL crop handles partially out of bounds?
+                # Better to keep aspect ratio or allow free pan?
+                # Let's clean up coordinate math:
+                # Pan 0,0 is center. -1 is left edge touches center? No.
+                # Let's map Pan -1..1 to moving the center across the image width/height?
+                
+                # Simple Clamp
+                left = max(0, min(left, w - crop_w))
+                top = max(0, min(top, h - crop_h))
+                
+                pil_crop = pil_img.crop((left, top, left + crop_w, top + crop_h))
+                
+                # Upscale to target
+                target_width = 2000
+                scale = max(1.0, target_width / float(crop_w))
+                new_size = (int(crop_w * scale), int(crop_h * scale))
+                
+                pil_crop = pil_crop.resize(new_size, Image.NEAREST)
+                upscaled_arr = np.array(pil_crop)
+                
+                self._modal_image_handle.image = upscaled_arr
+
+            with event.client.add_modal("Fullscreen View") as modal:
+                # Add Image natively (placeholder, updated immediately)
+                self._modal_image_handle = event.client.gui.add_image(
+                    self._current_img_array, # temporary
+                    format="jpeg",
+                )
+                
+                # Add Controls to Modal
+                with event.client.gui.add_folder("Controls"):
+                    self._modal_slider_handle = event.client.gui.add_slider(
+                        "Frame",
+                        min=0,
+                        max=len(self._current_images) - 1,
+                        step=1,
+                        initial_value=self._image_slider.value
+                    )
+                    
+                    self._modal_zoom = event.client.gui.add_slider("Zoom", min=1.0, max=10.0, step=0.1, initial_value=1.0)
+                    self._modal_pan_x = event.client.gui.add_slider("Pan X", min=-1.0, max=1.0, step=0.01, initial_value=0.0)
+                    self._modal_pan_y = event.client.gui.add_slider("Pan Y", min=-1.0, max=1.0, step=0.01, initial_value=0.0)
+                    
+                    play_btn = event.client.gui.add_button("Play", icon=viser.Icon.PLAYER_PLAY)
+                    pause_btn = event.client.gui.add_button("Pause", icon=viser.Icon.PLAYER_PAUSE)
+                    close_btn = event.client.gui.add_button("Close", icon=viser.Icon.X)
+
+                    # Link controls
+                    self._modal_slider_handle.on_update(lambda _: setattr(self._image_slider, 'value', self._modal_slider_handle.value))
+                    
+                    # Update view on zoom/pan
+                    self._modal_zoom.on_update(lambda _: _update_view())
+                    self._modal_pan_x.on_update(lambda _: _update_view())
+                    self._modal_pan_y.on_update(lambda _: _update_view())
+                    
+                    play_btn.on_click(lambda _: self._on_play(None))
+                    pause_btn.on_click(lambda _: self._on_pause(None))
+                    close_btn.on_click(lambda _: modal.close())
+                    
+                    # Store update function for external sync?
+                    self._modal_update_func = _update_view
+                    
+                    # Initial update
+                    _update_view()
+
+    def _sync_modal(self):
+        pass
+
     def _on_object_select(self, event):
         val = self._object_dropdown.value
         if val == "None":
             self._current_node = None
             self._clear_visuals()
+            self._playing = False
+            self._image_slider.visible = False
+            self._playback_folder.visible = False
+            self._maximize_btn.visible = False
             return
 
         node_id = self._node_map[val]
@@ -236,9 +412,29 @@ class ObjectManager:
     def _on_jump(self, event):
         if self._current_node and event.client:
             pos = self._current_node.attributes.position
+            
+            # If 3D image is shown, look at it
+            if self._show_3d_image.value and self._image_handle_3d is not None:
+                # Get position from handle if possible
+                try:
+                    target_pos = self._image_handle_3d.position
+                    # Image is in XZ plane facing +Y (due to -90 X rotation)
+                    # So we want to look at it from +Y direction
+                    # target_pos is the center of the image
+                    
+                    event.client.camera.look_at = target_pos
+                    # Stand back in Y
+                    # Zoom out more (User request: "zoom out a more")
+                    # Previous: 3.0. New: 6.0
+                    event.client.camera.position = target_pos + np.array([0.0, 6.0, 0.0])
+                    return
+                except:
+                    pass
+            
+            # Fallback to oblique view
             event.client.camera.look_at = pos
             # Zoom out a bit
-            event.client.camera.position = pos + np.array([-3.0, -3.0, 3.0])
+            event.client.camera.position = pos + np.array([-5.0, -5.0, 5.0])
 
     def _on_view_update(self, event):
         self._update_selection()
@@ -262,6 +458,28 @@ class ObjectManager:
         if not self._current_node:
             return
 
+        # Find images first to populate slider
+        self._current_images = self._find_all_images(self._current_node)
+        
+        if len(self._current_images) > 1:
+            self._image_slider.max = len(self._current_images) - 1
+            self._image_slider.visible = True
+            self._playback_folder.visible = True
+            # Don't reset slider if playing/scrolling unless out of bounds?
+            # Creating a new node selection usually resets.
+            # self._image_slider.value = 0 # Optional: Reset to 0 on new object
+        else:
+            self._image_slider.visible = False
+            self._playback_folder.visible = False
+            self._playing = False
+            self._image_slider.value = 0
+            
+        # Always show maximize if images exist
+        if self._current_images:
+            self._maximize_btn.visible = True
+        else:
+            self._maximize_btn.visible = False
+            
         self._update_image()
         self._update_mesh()
 
@@ -330,160 +548,287 @@ class ObjectManager:
         return "Unknown"
 
     def _update_image(self):
-        # Find image
-        image_path, meta_path = self._find_image_paths(self._current_node)
+        if not self._current_node:
+            return
+
+        image_path = None
+        meta_path = None
+
+        if self._current_images:
+            idx = int(self._image_slider.value)
+            # Ensure valid index
+            idx = max(0, min(idx, len(self._current_images) - 1))
+            if idx < len(self._current_images):
+                image_path, meta_path, mask_path = self._current_images[idx]
+        
         if not image_path:
+            # Fallback legacy single image search if list empty?
+            # Or just return
             return
             
         try:
             # Load Image
             pil_image = Image.open(image_path)
             
-            # Draw BBox if requested (for 2D only)
-            image_for_2d = pil_image.copy()
+            # Apply Mask if requested and available
+            if self._show_mask.value and mask_path and mask_path.exists():
+                try:
+                    mask_img = Image.open(mask_path).convert("L")
+                    # Resize mask if needed (should match, but safety)
+                    if mask_img.size != pil_image.size:
+                        mask_img = mask_img.resize(pil_image.size)
+                    
+                    # Ensure mask is visible (0-255) even if it's 0-1 class indices
+                    mask_img = mask_img.point(lambda p: 255 if p > 0 else 0)
+                    
+                    # Create a red overlay
+                    # We can use the mask as alpha for a solid color layer
+                    overlay = Image.new("RGBA", pil_image.size, (0, 0, 255, 0)) # Blue mask? Or user want specific?
+                    # Let's use a semi-transparent red or blue for visibility
+                    # Red: (255, 0, 0, 100)
+                    
+                    # Better: Create an overlay image
+                    # Where mask > 0, we add color
+                    mask_arr = np.array(mask_img)
+                    
+                    # Convert main to RGBA
+                    pil_image = pil_image.convert("RGBA")
+                    
+                    # Create colored overlay
+                    color_layer = Image.new("RGBA", pil_image.size, (255, 0, 0, 100)) # Red tint
+                    
+                    # Use mask as alpha for the color layer
+                    # Adjust mask to be binary 0-255 for alpha
+                    # If mask is 0 (bg) -> 0 alpha. If mask > 0 (obj) -> 100 alpha?
+                    # The mask image is likely 0 and 255 already or 0 and 1?
+                    # Let's assume non-zero is object
+                    
+                    # Create a composite
+                    pil_image = Image.composite(color_layer, pil_image, mask_img)
+                    
+                except Exception as e:
+                    print(f"Error applying mask: {e}")
+
+            # Draw BBox if requested (for 2D only AND 3D if desired)
+            # User request: "check boxes for the boudning box work on the image that's displayed in 3D"
+            # So we apply it to the base image used for both.
             if self._toggle_bbox_2d.value and meta_path and meta_path.exists():
-                self._draw_2d_bbox(image_for_2d, meta_path)
+                self._draw_2d_bbox(pil_image, meta_path)
 
             # Convert to numpy for viser
-            img_array_2d = np.array(image_for_2d)
-            img_array_raw = np.array(pil_image)
+            img_array_final = np.array(pil_image.convert("RGB"))
+            self._current_img_array = img_array_final # Cache for modal
             
             # Retrieve Object Name
             obj_name = self._get_object_label(self._current_node)
 
             # 2D Side Panel Image
-            with self._image_container:
-                self._image_handle_2d = self._server.gui.add_image(
-                    img_array_2d,
-                    label=f"{obj_name} ({self._current_node.id})",
-                    format="jpeg"
-                )
+            idx_str = ""
+            if len(self._current_images) > 1:
+                idx_str = f" [{int(self._image_slider.value)}/{len(self._current_images)-1}]"
+            label_text = f"{obj_name} ({self._current_node.id}){idx_str}"
+
+            if self._image_handle_2d is not None:
+                self._image_handle_2d.image = img_array_final
+                self._image_handle_2d.label = label_text
+            else:
+                with self._image_container:
+                    self._image_handle_2d = self._server.gui.add_image(
+                        img_array_final,
+                        label=label_text,
+                        format="jpeg"
+                    )
+            
+            # Sync Modal if open
+            try:
+                if hasattr(self, "_modal_image_handle") and self._modal_image_handle is not None:
+                    # Sync Slider if loop updated it
+                    if hasattr(self, "_modal_slider_handle") and self._modal_slider_handle is not None:
+                        if self._modal_slider_handle.value != int(self._image_slider.value):
+                            self._modal_slider_handle.value = int(self._image_slider.value)
+                            
+                    # Trigger view update (which handles cropping and setting image)
+                    if hasattr(self, "_modal_update_func"):
+                        self._modal_update_func()
+                        
+            except Exception:
+                    # Handle invalidated handles (modal closed)
+                    self._modal_image_handle = None
+                    self._modal_slider_handle = None
+                    self._modal_update_func = None
             
             # 3D Scene Image
             if self._show_3d_image.value:
                 # Position above the object?
-                pos = self._current_node.attributes.position
-                # Default size?
-                # Using add_image in scene
-                # Need to determine dimensions or scale. 
-                # Let's pick a reasonable width like 1.0 or 2.0 meters?
+                pos = np.array(self._current_node.attributes.position)
+                
+                # Calculate top of bbox
+                z_offset = 0.5 # Default fallback
+                if hasattr(self._current_node.attributes, "bounding_box"):
+                     bbox = self._current_node.attributes.bounding_box
+                     if bbox.is_valid():
+                         # world_P_center is the bbox center
+                         # dimensions is full width/height/depth
+                         # z_max = center.z + dim.z / 2
+                         # But wait, position logic?
+                         # Usually node position is centroid. 
+                         # Let's rely on bbox center + half height
+                         center = np.array(bbox.world_P_center)
+                         dims = np.array(bbox.dimensions)
+                         z_max = center[2] + dims[2] / 2.0
+                         
+                         # If we want to place image *above* this point
+                         # Current pos is node position.
+                         # We want image bottom to be at z_max + padding
+                         
+                         # Image height in world is 'height'
+                         # Image center Z = bottom_Z + height/2
+                         # So Image Center Z = (z_max + padding) + height/2
+                         
+                         # Let's calculate rendering dims first
+                         width = 2.0
+                         if self._maximize_2d.value:
+                            width = 5.0
+                         height = width * (img_array_final.shape[0] / img_array_final.shape[1])
+                         
+                         padding = 0.5
+                         target_z_center = z_max + padding + (height / 2.0)
+                         
+                         # Update pos vector
+                         # Keep X,Y from node or bbox center? BBox center is safer for object alignment
+                         pos[0] = center[0]
+                         pos[1] = center[1]
+                         pos[2] = target_z_center
+                         
+                         z_offset = dims[2] * 0.5 + 1.0 # fallback for old logic if needed, but we use absolute calc now
+
+                # ... dimensions ...
+                # Recalculated above for Z positioning
                 width = 2.0
-                # If "Maximize" is checked, maybe make it huge in 3D?
                 if self._maximize_2d.value:
                     width = 5.0
-                
-                height = width * (img_array_raw.shape[0] / img_array_raw.shape[1])
-                
-                # Orientation: Face up (Vertical)
-                # Previous +pi/2 resulted in upside down.
-                # Let's try -pi/2.
+                height = width * (img_array_final.shape[0] / img_array_final.shape[1])
+
                 wxyz = vtf.SO3.from_x_radians(-np.pi/2).wxyz
+                # pos is now the CENTER of the image in world space
                 
-                img_pos = pos + np.array([0, 0, 1.0])
-                
-                self._image_handle_3d = self._server.scene.add_image(
-                    f"/image_3d_{self._current_node.id}",
-                    image=img_array_raw,
-                    render_width=width,
-                    render_height=height,
-                    position=img_pos, # 1m above center
-                    wxyz=wxyz,
-                    format="jpeg"
-                )
+                if self._image_handle_3d is not None:
+                    self._image_handle_3d.image = img_array_final
+                    self._image_handle_3d.position = pos
+                    self._image_handle_3d.render_width = width
+                    self._image_handle_3d.render_height = height
+                else:
+                    self._image_handle_3d = self._server.scene.add_image(
+                        f"/image_3d_{self._current_node.id}",
+                        image=img_array_final,
+                        render_width=width,
+                        render_height=height,
+                        position=pos, 
+                        wxyz=wxyz,
+                        format="jpeg"
+                    )
                 
                 # Add 3D Label above image
-                # Image is centered at img_pos with height 'height'.
-                # Top of image is img_pos.z + height/2 (since vertical)
-                label_pos = img_pos + np.array([0, 0, height/2 + 0.2])
+                # Top of image = pos.z + height/2
+                # Label at Top + 0.2
+                label_pos = pos + np.array([0, 0, height/2 + 0.2])
+                label_txt_3d = f"{obj_name} ({self._current_node.id})"
                 
-                self._image_label_3d = self._server.scene.add_label(
-                    f"/image_label_{self._current_node.id}",
-                    text=f"{obj_name} ({self._current_node.id})",
-                    position=label_pos
-                )
+                if self._image_label_3d is not None:
+                    self._image_label_3d.text = label_txt_3d
+                    self._image_label_3d.position = label_pos
+                else:
+                    self._image_label_3d = self._server.scene.add_label(
+                        f"/image_label_{self._current_node.id}",
+                        text=label_txt_3d,
+                        position=label_pos
+                    )
             
         except Exception as e:
             print(f"Error loading image for {self._current_node.id}: {e}")
 
-    def _find_image_paths(self, node):
-        # logging less spam
-        # Try to find image folder from attributes
+    def _find_all_images(self, node):
+        # Similar logic to _find_image_paths but returns all of them sorted
+        images_list = []
+        
         if not hasattr(node.attributes, "image_folder"):
-            return None, None
+            return images_list
             
         folder = node.attributes.image_folder
         if not folder:
-            return None, None
+            return images_list
             
         folder_path = Path(folder)
         if self._image_root:
-            # If folder is absolute, image_root might be ignored or used to re-root?
-            # Usually strict append if relative.
             if not folder_path.is_absolute():
                 folder_path = self._image_root / folder_path
             
-        # print(f"  Checking folder path: {folder_path}")
         if not folder_path.exists():
-            # Fallback for "temp" paths: .../images/temp/O_XX -> .../images/O_{node_id}
-            if "temp" in folder_path.parts:
+            # Fallback logic copy-paste from original find_image_paths
+             if "temp" in folder_path.parts:
                 try:
-                    # Find 'temp' index and go up one level
-                    # Assuming structure .../images/temp/O_XX
-                    # We want .../images/O_{node.id.category_id}
-                    # If we perform path manipulation:
                     new_path = Path(str(folder_path).replace("/temp/", "/"))
-                    # But we also need to change the folder name from O_TRACKID to O_NODEID
-                    # So proper way is to find the 'images' dir (parent of temp)
-                    # This is heuristic based on user input
                     parent = folder_path.parent.parent
                     fallback_node = parent / f"O_{node.id.category_id}"
-                    
-                    # print(f"  Temp path detected. Trying fallback: {fallback_node}")
                     if fallback_node.exists():
                         folder_path = fallback_node
-                except Exception as e:
-                    pass # print(f"  Error in path fallback: {e}")
+                except Exception:
+                    pass
 
-        
         if not folder_path.exists():
-            # Fallback: maybe just image_root / O_<id>?
             if self._image_root:
                 fallback = self._image_root / f"O_{node.id.category_id}"
-                # print(f"  Folder not found. Checking fallback root: {fallback}")
                 if fallback.exists():
                     folder_path = fallback
-                # Try finding folder by name O_ID
-                else: 
-                     # Search inside root?
-                     pass
         
         if not folder_path.exists():
-             # print("  Folder does not exist")
-             return None, None
+             return images_list
 
-        # Find first RGB image
-        # Pattern: frame_*_rgb.jpg
+        # Find all RGB images
         images = list(folder_path.glob("*_rgb.jpg")) + list(folder_path.glob("*_rgb.png"))
-        # print(f"  Found images: {len(images)} in {folder_path}")
         if not images:
-            return None, None
+            return images_list
             
-        # Pick the first one or middle one? User didn't specify. First is fine.
-        image_file = images[0]
-
+        # Parse timestamps to sort
+        # Pattern: frame_{timestamp}_rgb.jpg
         
-        # Find corresponding meta
-        # Pattern: frame_{timestamp}_rgb.jpg -> frame_{timestamp}_meta.json
-        # Assuming format frame_TIMESTAMP_suffix
-        parts = image_file.name.split('_')
-        # frame, timestamp, rgb.jpg
-        if len(parts) >= 3:
-            timestamp = parts[1]
-            meta_file = folder_path / f"frame_{timestamp}_meta.json"
-        else:
-            meta_file = None
+        parsed_images = []
+        for img in images:
+            parts = img.name.split('_')
+            ts = 0
+            if len(parts) >= 3:
+                 try:
+                    ts = int(parts[1])
+                 except:
+                    pass
             
-        return image_file, meta_file
+            # Meta file
+            meta_file = None
+            mask_file = None
+            if len(parts) >= 3:
+                 # Reconstruct base name? 
+                 # frame_TS_meta.json
+                 meta_name = f"frame_{parts[1]}_meta.json"
+                 meta_file = folder_path / meta_name
+
+                 # Mask file
+                 mask_name = f"frame_{parts[1]}_mask.png"
+                 mask_file = folder_path / mask_name
+                 
+            parsed_images.append((ts, img, meta_file, mask_file))
+            
+        # Sort by timestamp
+        parsed_images.sort(key=lambda x: x[0])
+        
+        return [(x[1], x[2], x[3]) for x in parsed_images]
+
+    def _find_image_paths(self, node):
+        # Legacy wrapper or just use first of all images
+        all_imgs = self._find_all_images(node)
+        if all_imgs:
+            # Return path/meta only to match signature if used elsewhere, or just full tuple?
+            return all_imgs[0][0], all_imgs[0][1]
+        return None, None
 
     def _draw_2d_bbox(self, pil_image, meta_path):
         try:
