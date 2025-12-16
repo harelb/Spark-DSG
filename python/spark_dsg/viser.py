@@ -18,6 +18,29 @@ import threading
 from pathlib import Path
 from PIL import Image, ImageDraw
 
+# Cache valid for mostly static images on disk
+@functools.lru_cache(maxsize=128)
+def load_and_process_image(path, max_dim=1024):
+    try:
+        with Image.open(path) as img:
+            # Resize if too large to save bandwidth/memory
+            w, h = img.size
+            if max(w, h) > max_dim:
+                scale = max_dim / float(max(w, h))
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                img = img.resize((new_w, new_h), Image.LANCZOS)
+            
+            # Convert to RGB to ensure consistency
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+                
+            return np.array(img)
+    except Exception as e:
+        print(f"Error loading image {path}: {e}")
+        return None
+
+
 import spark_dsg as dsg
 
 
@@ -29,7 +52,26 @@ class ColorMode(enum.Enum):
 
 
 def _layer_name(layer_key):
-    return f"layer_{layer_key.layer}p{layer_key.partition}"
+    # Static mappings based on spark_dsg bindings
+    base_names = {
+        2: "Objects",
+        3: "Places",
+        4: "Rooms",
+        5: "Buildings"
+    }
+    
+    # Special handle for known partitions
+    if layer_key.layer == 3 and layer_key.partition == 1:
+        return "Mesh Places"
+        
+    base = base_names.get(layer_key.layer, f"Layer {layer_key.layer}")
+    
+    if layer_key.partition != 0:
+        if layer_key.layer == 2:
+            return f"Agents ({layer_key.partition})"
+        return f"{base} (p{layer_key.partition})"
+        
+    return base
 
 
 def color_from_label(G, node, default=None):
@@ -195,6 +237,9 @@ class ObjectManager:
         self._current_img_array = None # Cache for modal
         self._playing = False
         self._playback_thread = None
+        self._lock = threading.Lock()
+        
+        # Populate dropdown
         
         # Populate dropdown
         self._update_dropdown()
@@ -237,7 +282,9 @@ class ObjectManager:
         for node in object_nodes:
             label = f"{node.id}"
             if hasattr(node.attributes, "name") and node.attributes.name:
-                label += f" ({node.attributes.name})"
+                # Sanitize name to avoid JS issues
+                safe_name = str(node.attributes.name).replace('"', '').replace("'", "").replace("\\", "")
+                label += f" ({safe_name})"
             options.append(label)
             self._node_map[label] = node.id.value
 
@@ -247,44 +294,58 @@ class ObjectManager:
         # Find label for node
         target_val = node.id.value
         found_label = "None"
-        for label, val in self._node_map.items():
-            if val == target_val:
-                found_label = label
-                break
+        with self._lock:
+            for label, val in self._node_map.items():
+                if val == target_val:
+                    found_label = label
+                    break
         
         if found_label != "None":
             # Only update if different to avoid flicker
             if self._object_dropdown.value != found_label:
                 self._object_dropdown.value = found_label
             
-            # Use current selection logic
-            self._current_node = node
-            self._update_selection()
+            # Use current selection logic which acquires lock internally
+            # But we set _current_node here? No, _on_object_select does.
+            # We just change the dropdown, which triggers _on_object_select
+            pass
 
     def _playback_loop(self):
         while True:
-            if self._playing and self._current_images:
+            # Snapshot state safely
+            should_play = False
+            image_count = 0
+            
+            with self._lock:
+                should_play = self._playing
+                image_count = len(self._current_images)
+            
+            if should_play and image_count > 0:
                 try:
+                    # We need to update slider on main thread usually? 
+                    # Viser handles are thread safe for updates generally, but logic needs sync
                     current_idx = self._image_slider.value
-                    max_idx = len(self._current_images) - 1
+                    max_idx = image_count - 1
                     
                     if max_idx > 0:
                         next_idx = (current_idx + 1) % (max_idx + 1)
                         self._image_slider.value = next_idx
                         
-                    sleep_time = 1.0 / self._fps_number.value
+                    sleep_time = 1.0 / max(1.0, self._fps_number.value)
                     time.sleep(sleep_time)
                 except Exception as e:
                     print(f"Playback error: {e}")
-                    self._playing = False
+                    with self._lock:
+                        self._playing = False
             else:
                 time.sleep(0.1)
 
     def _on_slider_update(self, event):
         # Only update if image changed
-        if not self._current_node:
-             return
-        self._update_image()
+        with self._lock:
+            if not self._current_node:
+                 return
+            self._update_image()
 
     def _on_play(self, event):
         self._playing = True
@@ -396,18 +457,22 @@ class ObjectManager:
 
     def _on_object_select(self, event):
         val = self._object_dropdown.value
-        if val == "None":
-            self._current_node = None
-            self._clear_visuals()
-            self._playing = False
-            self._image_slider.visible = False
-            self._playback_folder.visible = False
-            self._maximize_btn.visible = False
-            return
+        with self._lock:
+            if val == "None":
+                self._current_node = None
+                self._clear_visuals()
+                self._playing = False
+                self._image_slider.visible = False
+                self._playback_folder.visible = False
+                self._maximize_btn.visible = False
+                return
 
-        node_id = self._node_map[val]
-        self._current_node = self._G.get_node(node_id)
-        self._update_selection()
+            node_id = self._node_map.get(val)
+            if node_id is None:
+                return
+                
+            self._current_node = self._G.get_node(node_id)
+            self._update_selection()
 
     def _on_jump(self, event):
         if self._current_node and event.client:
@@ -437,7 +502,8 @@ class ObjectManager:
             event.client.camera.position = pos + np.array([-5.0, -5.0, 5.0])
 
     def _on_view_update(self, event):
-        self._update_selection()
+        with self._lock:
+            self._update_selection()
         
     def _clear_visuals(self):
         if self._image_handle_2d:
@@ -454,6 +520,7 @@ class ObjectManager:
             self._mesh_handle = None
 
     def _update_selection(self):
+        # Assumes lock is held by caller
         self._clear_visuals()
         if not self._current_node:
             return
@@ -465,9 +532,6 @@ class ObjectManager:
             self._image_slider.max = len(self._current_images) - 1
             self._image_slider.visible = True
             self._playback_folder.visible = True
-            # Don't reset slider if playing/scrolling unless out of bounds?
-            # Creating a new node selection usually resets.
-            # self._image_slider.value = 0 # Optional: Reset to 0 on new object
         else:
             self._image_slider.visible = False
             self._playback_folder.visible = False
@@ -548,11 +612,18 @@ class ObjectManager:
         return "Unknown"
 
     def _update_image(self):
+        # Check lock? Usually called from protected methods.
+        # But _on_slider_update calls it too.
+        # We should check if we already hold the lock? 
+        # RLock would be better, but we use standard Lock. 
+        # _on_slider_update needs to acquire lock.
+        
         if not self._current_node:
             return
 
         image_path = None
         meta_path = None
+        mask_path = None
 
         if self._current_images:
             idx = int(self._image_slider.value)
@@ -562,58 +633,41 @@ class ObjectManager:
                 image_path, meta_path, mask_path = self._current_images[idx]
         
         if not image_path:
-            # Fallback legacy single image search if list empty?
-            # Or just return
             return
             
         try:
-            # Load Image
-            pil_image = Image.open(image_path)
+            # Use Cached Loader
+            img_array_base = load_and_process_image(str(image_path), max_dim=1024)
+            if img_array_base is None:
+                return
+
+            pil_image = Image.fromarray(img_array_base)
             
             # Apply Mask if requested and available
             if self._show_mask.value and mask_path and mask_path.exists():
                 try:
+                    # Masks are usually small/compressible, maybe cache too? 
+                    # For now just load.
                     mask_img = Image.open(mask_path).convert("L")
-                    # Resize mask if needed (should match, but safety)
+                    
+                    # Resize mask to match base image (which might have been resized)
                     if mask_img.size != pil_image.size:
-                        mask_img = mask_img.resize(pil_image.size)
+                        mask_img = mask_img.resize(pil_image.size, Image.NEAREST)
                     
-                    # Ensure mask is visible (0-255) even if it's 0-1 class indices
-                    mask_img = mask_img.point(lambda p: 255 if p > 0 else 0)
+                    # Create red overlay
+                    color_layer = Image.new("RGBA", pil_image.size, (255, 0, 0, 100))
                     
-                    # Create a red overlay
-                    # We can use the mask as alpha for a solid color layer
-                    overlay = Image.new("RGBA", pil_image.size, (0, 0, 255, 0)) # Blue mask? Or user want specific?
-                    # Let's use a semi-transparent red or blue for visibility
-                    # Red: (255, 0, 0, 100)
-                    
-                    # Better: Create an overlay image
-                    # Where mask > 0, we add color
-                    mask_arr = np.array(mask_img)
-                    
-                    # Convert main to RGBA
+                    # Composite
                     pil_image = pil_image.convert("RGBA")
-                    
-                    # Create colored overlay
-                    color_layer = Image.new("RGBA", pil_image.size, (255, 0, 0, 100)) # Red tint
-                    
-                    # Use mask as alpha for the color layer
-                    # Adjust mask to be binary 0-255 for alpha
-                    # If mask is 0 (bg) -> 0 alpha. If mask > 0 (obj) -> 100 alpha?
-                    # The mask image is likely 0 and 255 already or 0 and 1?
-                    # Let's assume non-zero is object
-                    
-                    # Create a composite
                     pil_image = Image.composite(color_layer, pil_image, mask_img)
                     
                 except Exception as e:
                     print(f"Error applying mask: {e}")
 
-            # Draw BBox if requested (for 2D only AND 3D if desired)
-            # User request: "check boxes for the boudning box work on the image that's displayed in 3D"
-            # So we apply it to the base image used for both.
+            # Draw BBox if requested
             if self._toggle_bbox_2d.value and meta_path and meta_path.exists():
-                self._draw_2d_bbox(pil_image, meta_path)
+                # We need to scale bbox if we resized image!
+                self._draw_2d_bbox(pil_image, meta_path, original_size=self._get_original_size(image_path))
 
             # Convert to numpy for viser
             img_array_final = np.array(pil_image.convert("RGB"))
@@ -830,7 +884,15 @@ class ObjectManager:
             return all_imgs[0][0], all_imgs[0][1]
         return None, None
 
-    def _draw_2d_bbox(self, pil_image, meta_path):
+    def _get_original_size(self, path):
+         # Just read header to get size
+         try:
+             with Image.open(path) as img:
+                 return img.size
+         except:
+             return (1, 1)
+
+    def _draw_2d_bbox(self, pil_image, meta_path, original_size=None):
         try:
             with open(meta_path, 'r') as f:
                 data = json.load(f)
@@ -843,6 +905,19 @@ class ObjectManager:
                 max_y = bbox.get("max_y")
                 
                 if all(v is not None for v in [min_x, min_y, max_x, max_y]):
+                    
+                    # Scale if necessary
+                    if original_size and original_size != pil_image.size:
+                        orig_w, orig_h = original_size
+                        cur_w, cur_h = pil_image.size
+                        scale_x = cur_w / float(orig_w)
+                        scale_y = cur_h / float(orig_h)
+                        
+                        min_x *= scale_x
+                        max_x *= scale_x
+                        min_y *= scale_y
+                        max_y *= scale_y
+                        
                     draw = ImageDraw.Draw(pil_image)
                     draw.rectangle([min_x, min_y, max_x, max_y], outline="red", width=3)
         except Exception as e:
@@ -894,6 +969,7 @@ class LayerHandle:
         """Add options for layer to viser."""
         self.key = layer.key
         self.name = _layer_name(layer.key)
+        self._path_handle = None
         if parent_callback:
             self._parent_callback = parent_callback
         else:
@@ -902,11 +978,7 @@ class LayerHandle:
         self._object_manager = None # Will be set if passed
 
 
-        self._folder = server.gui.add_folder(self.name)
-        try:
-            self._folder.open = False # Try to collapse if property exists
-        except:
-            pass
+        self._folder = server.gui.add_folder(self.name, expand_by_default=False)
             
         with self._folder:
             # Layer controls
@@ -928,6 +1000,12 @@ class LayerHandle:
             self._draw_bboxes = server.gui.add_checkbox(
                 "draw_bboxes", initial_value=config.draw_bboxes
             )
+            
+            # Special: Path drawing for Agents
+            self._draw_path = None
+            if layer.key.layer == 2: # Agents
+                 self._draw_path = server.gui.add_checkbox("draw_path", initial_value=False)
+                 self._draw_path.on_update(lambda _: self._update())
 
 
         self._nodes = None
@@ -968,7 +1046,30 @@ class LayerHandle:
 
         if self._draw_bboxes.value:
             self._update_bboxes(G, layer)
-
+            
+        # Draw Path if requested
+        if self._path_handle:
+            self._path_handle.remove()
+            self._path_handle = None
+            
+        if self._draw_path and self._draw_path.value:
+             try:
+                 # We need nodes sorted by ID to form a path
+                 # layer.nodes is list[SceneGraphNode]
+                 sorted_nodes = sorted(layer.nodes, key=lambda n: n.id.value)
+                 
+                 # Extract positions
+                 points = np.array([n.attributes.position for n in sorted_nodes])
+                 
+                 if len(points) >= 2:
+                     self._path_handle = self._server.scene.add_line_strip(
+                         f"{self.name}_path",
+                         points,
+                         color=(0.0, 1.0, 0.0), # Green path? Or make configurable?
+                         line_width=3.0
+                     )
+             except Exception as e:
+                 print(f"Error drawing path: {e}")
 
         self._update()
         self._draw_nodes.on_update(lambda _: self._update())
@@ -1253,6 +1354,7 @@ class GraphHandle:
     def _layer_height(self, layer_key):
         return self._height_scale * layer_key.layer
 
+
     def _update(self):
         for source_key, targets in self._edge_handles.items():
             for target_key, handle in targets.items():
@@ -1276,10 +1378,18 @@ class MeshHandle:
         )
 
         self._mesh_handle = server.scene.add_mesh_trimesh(name="/mesh", mesh=mesh)
+        
+        # Add GUI
+        self._folder = server.gui.add_folder("Global Mesh")
+        with self._folder:
+            self._visible = server.gui.add_checkbox("Show Mesh", initial_value=True)
+            
+        self._visible.on_update(lambda _: setattr(self._mesh_handle, "visible", self._visible.value))
 
     def remove(self):
         """Remove mesh elements from the visualizer."""
         self._mesh_handle.remove()
+        self._folder.remove()
 
 
 class ViserRenderer:
