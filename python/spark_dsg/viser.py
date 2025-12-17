@@ -232,6 +232,16 @@ class ObjectManager:
                 initial_value="None"
             )
             self._jump_button = server.gui.add_button("Jump to Object")
+            
+            # Sidebar Navigation
+            # Place small buttons for prev/next
+            with server.gui.add_folder("Navigation", visible=True) as nav_folder:
+                 self._side_prev_btn = server.gui.add_button("Prev", icon=viser.Icon.ARROW_LEFT)
+                 self._side_next_btn = server.gui.add_button("Next", icon=viser.Icon.ARROW_RIGHT)
+                 
+            self._side_prev_btn.on_click(lambda _: self._step_object(-1))
+            self._side_next_btn.on_click(lambda _: self._step_object(1))
+            
             self._toggle_mesh = server.gui.add_checkbox("Show Object Mesh", initial_value=True)
             self._toggle_bbox_2d = server.gui.add_checkbox("Show 2D BBox", initial_value=True)
             self._show_mask = server.gui.add_checkbox("Show Mask", initial_value=False)
@@ -255,13 +265,11 @@ class ObjectManager:
                  self._play_button = server.gui.add_button("Play", icon=viser.Icon.PLAYER_PLAY)
                  self._pause_button = server.gui.add_button("Pause", icon=viser.Icon.PLAYER_PAUSE, visible=False)
                  self._fps_number = server.gui.add_number("FPS", initial_value=10.0, min=1.0, max=60.0)
+                 self._save_gif_btn = server.gui.add_button("Save as GIF", icon=viser.Icon.FILE_DOWNLOAD)
 
         self._current_node = None
         self._node_map = {} # label -> node_id
-        self._current_node = None
-        self._node_map = {} # label -> node_id
         self._current_images = [] # List of (image_path, depth_path, meta_path, mask_path)
-        self._current_img_array = None # Cache for modal
         self._current_img_array = None # Cache for modal
         self._playing = False
         self._playback_thread = None
@@ -294,6 +302,7 @@ class ObjectManager:
         self._maximize_btn.on_click(self._on_maximize_click)
         self._play_button.on_click(self._on_play)
         self._pause_button.on_click(self._on_pause)
+        self._save_gif_btn.on_click(self._on_save_gif)
 
         # Start playback thread
         self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
@@ -410,6 +419,86 @@ class ObjectManager:
         except Exception:
             pass
 
+    def _generate_and_download_gif(self, client, button_handle=None):
+        """Helper to generate and download GIF. Shared by main and modal uis."""
+        if not self._current_images:
+            return
+
+        # Disable button/Update label if handle provided
+        if button_handle:
+            button_handle.disabled = True
+            button_handle.label = "Generating..."
+        
+        try:
+            images = []
+            durations = []
+            fps = float(self._fps_number.value)
+            frame_duration_ms = 1000.0 / fps
+            
+            # Iterate all frames
+            for i in range(len(self._current_images)):
+                 img = self._get_composed_image(i)
+                 if img:
+                     # Resize for reasonable GIF size if too large
+                     if img.width > 800:
+                         scaling = 800.0 / img.width
+                         new_size = (int(img.width * scaling), int(img.height * scaling))
+                         img = img.resize(new_size, Image.LANCZOS)
+                         
+                     images.append(img)
+                     durations.append(frame_duration_ms)
+            
+            if not images:
+                return
+
+            # Save to buffer
+            buf = io.BytesIO()
+            images[0].save(
+                buf,
+                format="GIF",
+                save_all=True,
+                append_images=images[1:],
+                optimize=True,
+                duration=durations,
+                loop=0
+            )
+            buf.seek(0)
+            
+            # Trigger download
+            file_data = buf.getvalue()
+            filename = f"sequence_{self._current_node.id}.gif"
+            
+            client.send_file_download(
+                filename,
+                file_data
+            )
+            
+        except Exception as e:
+            print(f"Error generating GIF: {e}")
+        finally:
+             if button_handle:
+                 button_handle.disabled = False
+                 button_handle.label = "Save as GIF"
+
+    def _on_save_gif(self, event):
+        """Generate and download a GIF of the current sequence."""
+        self._generate_and_download_gif(event.client, self._save_gif_btn)
+
+    def _step_object(self, delta):
+        """Cycle through objects in the dropdown."""
+        options = self._object_dropdown.options
+        if not options:
+            return
+            
+        current_val = self._object_dropdown.value
+        try:
+            idx = options.index(current_val)
+            new_idx = (idx + delta) % len(options)
+            self._object_dropdown.value = options[new_idx]
+        except ValueError:
+            if options:
+                self._object_dropdown.value = options[0]
+
     def _on_maximize_click(self, event):
             # Helper to update image based on zoom/pan/frame
             def _update_view():
@@ -451,6 +540,13 @@ class ObjectManager:
                     upscaled_arr = np.array(pil_crop)
                     
                     self._modal_image_handle.image = upscaled_arr
+                    
+                    # Update dynamic title
+                    if hasattr(self, "_modal_title_handle") and self._modal_title_handle is not None and self._current_node:
+                        obj_name = self._get_object_label(self._current_node)
+                        title_text = f"## {obj_name} ({self._current_node.id})"
+                        self._modal_title_handle.content = title_text
+                        
                 except Exception as e:
                     # Modal was closed or handle became invalid
                     pass
@@ -463,13 +559,18 @@ class ObjectManager:
                 pass
 
             # Get title with object name and class/ID
-            title = "Fullscreen View"
+
+            # Get title with object name and class/ID
+            init_title = ""
             if self._current_node:
                 obj_name = self._get_object_label(self._current_node)
-                title = f"{obj_name} ({self._current_node.id})"
+                init_title = f"## {obj_name} ({self._current_node.id})"
 
-            with event.client.gui.add_modal(title) as modal:
+            with event.client.gui.add_modal("Fullscreen View") as modal:
                 self._modal_handle = modal
+                
+                # Dynamic Title
+                self._modal_title_handle = event.client.gui.add_markdown(init_title)
 
                 # Add Image natively (placeholder, updated immediately)
                 self._modal_image_handle = event.client.gui.add_image(
@@ -513,6 +614,27 @@ class ObjectManager:
                     m_mask.on_update(_sync_mask)
                     m_mode.on_update(_sync_mode)
                     
+
+                    
+                    # Navigation Buttons (Placed above GIF/Play for better visibility)
+                    with event.client.gui.add_folder("Navigation"):
+                        b_prev = event.client.gui.add_button("Prev Object", icon=viser.Icon.ARROW_LEFT)
+                        b_next = event.client.gui.add_button("Next Object", icon=viser.Icon.ARROW_RIGHT)
+                    
+                    b_prev.on_click(lambda _: self._step_object(-1))
+                    b_next.on_click(lambda _: self._step_object(1))
+
+                    # GIF Button for Modal
+                    m_save_gif = event.client.gui.add_button("Save as GIF", icon=viser.Icon.FILE_DOWNLOAD)
+                    
+                    def _modal_save_gif(evt):
+                        self._generate_and_download_gif(evt.client, m_save_gif)
+                        
+                    m_save_gif.on_click(_modal_save_gif)
+
+
+                    
+                    # Playback
                     play_btn = event.client.gui.add_button("Play", icon=viser.Icon.PLAYER_PLAY)
                     pause_btn = event.client.gui.add_button("Pause", icon=viser.Icon.PLAYER_PAUSE, visible=False)
                     close_btn = event.client.gui.add_button("Close", icon=viser.Icon.X)
@@ -760,33 +882,18 @@ class ObjectManager:
             
         return "Unknown"
 
-    def _update_image(self):
-        # Check lock? Usually called from protected methods.
-        # But _on_slider_update calls it too.
-        # We should check if we already hold the lock? 
-        # RLock would be better, but we use standard Lock. 
-        # _on_slider_update needs to acquire lock.
-        
-        if not self._current_node:
-            return
-
-        image_path = None
-        depth_path = None
-        meta_path = None
-        mask_path = None
-
-        if self._current_images:
-            idx = int(self._image_slider.value)
-            # Ensure valid index
-            idx = max(0, min(idx, len(self._current_images) - 1))
-            if idx < len(self._current_images):
-                image_path, depth_path, meta_path, mask_path = self._current_images[idx]
+    def _get_composed_image(self, idx):
+        """Helper to get a single composed frame (RGB, Depth, or Both) as a PIL image."""
+        if not self._current_images or idx >= len(self._current_images):
+            return None
+            
+        image_path, depth_path, meta_path, mask_path = self._current_images[idx]
         
         # If RGB required but missing, return (unless handle depth only mode)
         # We can handle depth-only if image_path is None but depth_path exists? 
         # For now assume RGB always exists if we found it.
         if not image_path:
-            return
+            return None
             
         try:
             mode = self._display_mode.value
@@ -819,54 +926,17 @@ class ObjectManager:
                         # Robust normalization:
                         # 1. Ignore 0s (often invalid/mask) for min calculation if possible
                         valid_mask = arr > 0
-                        if valid_mask.any():
-                            # Use percentiles to robustly find range
-                            # 2% and 98% to avoid salt/pepper noise outliers
-                            d_min = np.percentile(arr[valid_mask], 2)
-                            d_max = np.percentile(arr[valid_mask], 98)
-                        else:
-                            d_min, d_max = arr.min(), arr.max()
-                            
-                        # Avoid div by zero
-                        if d_max > d_min:
-                            # Clip to range
-                            arr_clipped = np.clip(arr, d_min, d_max)
-                            # Normalize to 0-255
-                            arr_norm = ((arr_clipped - d_min) / (d_max - d_min) * 255.0)
-                            arr = arr_norm.astype(np.uint8)
-                        else:
-                            # If flat, just map to 0 or something visible? 
-                            # If all 0, keep 0. If all 1000, maybe make it 128? 
-                            # If valid_mask is empty, it's all 0s.
-                            if not valid_mask.any():
-                                arr = np.zeros_like(arr, dtype=np.uint8)
-                            else:
-                                # All same non-zero value -> make it grey
-                                arr = np.full_like(arr, 128, dtype=np.uint8)
-
-                        # If there were 0s originally that we want to keep black (invalid),
-                        # the clip/norm might have raised them if min < 0 (unlikely for depth).
-                        # But usually valid depth > 0. 
-                        # If we want 0 input to stay 0 output (black background):
-                        if valid_mask.any():
-                             # Ensure original 0s stay 0 (black)
-                             # Create mask where original was <= 0 (or close to 0 for float)
-                             invalid_mask = arr < (0.1 if d_img.mode in ['F', 'I'] else 1) 
-                             # Wait, 'arr' is already overwritten by float norm? No, arr_norm is new float.
-                             # We should apply mask to result.
-                             # Actually simpler: re-apply 0 where input was 0.
-                             # But 'arr' variable was reused. Let's fix that logic flow.
-                             pass 
-                             
-                        # Re-do logic cleanly:
-                        arr_f = np.array(d_img).astype(np.float32)
-                        valid_mask = arr_f > 0
+                        
+                        # If float or large int, convert to float32 first to avoid overflow/underflow issues during calc
+                        arr_f = arr.astype(np.float32)
                         
                         if valid_mask.any():
+                            # Use percentiles to robustly find range
                             v_vals = arr_f[valid_mask]
                             d_min = np.percentile(v_vals, 2)
                             d_max = np.percentile(v_vals, 98)
                             
+                            # Normalize
                             if d_max > d_min:
                                 norm = (arr_f - d_min) / (d_max - d_min)
                                 norm = np.clip(norm, 0, 1)
@@ -874,7 +944,7 @@ class ObjectManager:
                             else:
                                 arr_u8 = np.full_like(arr_f, 128, dtype=np.uint8)
                                 
-                            # Force invalid pixels to black
+                            # Force invalid to black
                             arr_u8[~valid_mask] = 0
                         else:
                             arr_u8 = np.zeros_like(arr_f, dtype=np.uint8)
@@ -915,14 +985,35 @@ class ObjectManager:
                     final_pil = pil_rgb
                 elif pil_depth:
                      final_pil = pil_depth
-
-            if not final_pil:
-                return
-
-            # Convert to numpy for viser
-            img_array_final = np.array(final_pil)
-            self._current_img_array = img_array_final # Cache for modal
             
+            return final_pil
+            
+        except Exception as e:
+            print(f"Error composing image: {e}")
+            return None
+
+
+    def _update_image(self):
+        # Check lock? Usually called from protected methods.
+        if not self._current_node:
+            return
+
+        final_pil = None
+        if self._current_images:
+            idx = int(self._image_slider.value)
+            # Ensure valid index
+            idx = max(0, min(idx, len(self._current_images) - 1))
+            
+            final_pil = self._get_composed_image(idx)
+        
+        if not final_pil:
+            return
+
+        # Convert to numpy for viser
+        img_array_final = np.array(final_pil)
+        self._current_img_array = img_array_final # Cache for modal
+            
+        try:
             # Retrieve Object Name
             obj_name = self._get_object_label(self._current_node)
 
