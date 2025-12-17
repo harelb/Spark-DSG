@@ -193,11 +193,34 @@ class ObjectManager:
         self._image_container = server.gui.add_folder("Selected Image")
 
         # Hacks for wider modals
-        # Viser uses Mantine UI. We can inject global styles via markdown.
-        server.gui.add_markdown(
+        # Viser uses Mantine UI. Inject global styles via HTML so <style> is respected.
+        server.gui.add_html(
             "<style>"
-            ".mantine-Modal-content { max-width: 95vw !important; width: auto !important; }"
+            # Default modal size (smaller than fullscreen), with small viewport margins.
+            ".mantine-Modal-root { --modal-size: 55vw !important; }"
+
+            # Make the modal resizable via corner drag. Important: don't lock width/height
+            # with !important, otherwise the browser resize handle can't change it.
+            ".mantine-Modal-content {"
+            "  flex: none !important;"
+            "  flex-basis: auto !important;"
+            "  width: var(--modal-size);"
+            "  height: 65vh;"
+            "  max-width: 95vw !important;"
+            "  max-height: 95vh !important;"
+            "  min-width: 360px;"
+            "  min-height: 320px;"
+            "  display: flex;"
+            "  flex-direction: column;"
+            "  resize: both;"
+            "  overflow: hidden;"
+            "}"
+
             ".mantine-Modal-inner { width: 100% !important; padding-left: 0 !important; padding-right: 0 !important; }"
+            ".mantine-Modal-body { padding: 0 !important; flex: 1 1 auto !important; overflow: auto !important; }"
+
+            # Ensure image doesn't push controls off-screen.
+            ".mantine-Modal-body img { width: 100% !important; height: auto !important; max-height: 42vh !important; object-fit: contain !important; display: block !important; }"
             "</style>"
         )
 
@@ -238,7 +261,15 @@ class ObjectManager:
         self._current_img_array = None # Cache for modal
         self._playing = False
         self._playback_thread = None
-        self._lock = threading.Lock()
+        # Re-entrant because we sometimes update UI from codepaths that already hold the lock.
+        self._lock = threading.RLock()
+        # Guard to prevent modal slider sync from recursively updating the main slider.
+        self._syncing_modal_slider = False
+
+        # Modal-only UI handles (for syncing playback controls).
+        self._modal_play_btn = None
+        self._modal_pause_btn = None
+        self._modal_handle = None
         
         # Populate dropdown
         
@@ -352,65 +383,83 @@ class ObjectManager:
         self._playing = True
         self._play_button.visible = False
         self._pause_button.visible = True
+        # Sync modal buttons if fullscreen is open.
+        try:
+            if self._modal_play_btn is not None:
+                self._modal_play_btn.visible = False
+            if self._modal_pause_btn is not None:
+                self._modal_pause_btn.visible = True
+        except Exception:
+            pass
 
     def _on_pause(self, event):
         self._playing = False
         self._play_button.visible = True
         self._pause_button.visible = False
+        # Sync modal buttons if fullscreen is open.
+        try:
+            if self._modal_play_btn is not None:
+                self._modal_play_btn.visible = True
+            if self._modal_pause_btn is not None:
+                self._modal_pause_btn.visible = False
+        except Exception:
+            pass
 
     def _on_maximize_click(self, event):
             # Helper to update image based on zoom/pan/frame
             def _update_view():
-                if not self._current_images:
-                     return
+                # Check if modal is still open
+                if (not self._current_images or 
+                    self._modal_image_handle is None or 
+                    self._modal_zoom is None or 
+                    self._modal_pan_x is None or 
+                    self._modal_pan_y is None):
+                    return
                 
-                # Get current raw image (re-read or cache?)
-                # We cache _current_img_array but that is for the SIDE PANEL (potentially with bbox/mask burned in?)
-                # Actually _update_image updates _current_img_array with the *final* 2D image (mask+bbox).
-                # So we can use it.
-                
-                # But wait, if we change frame via slider in modal, _current_img_array updates?
-                # Yes, because we link sliders.
-                
-                # Crop logic
-                pil_img = Image.fromarray(self._current_img_array)
-                w, h = pil_img.size
-                
-                zoom = self._modal_zoom.value
-                center_x = w / 2 * (1 + self._modal_pan_x.value)
-                center_y = h / 2 * (1 + self._modal_pan_y.value)
-                
-                crop_w = w / zoom
-                crop_h = h / zoom
-                
-                left = center_x - crop_w / 2
-                top = center_y - crop_h / 2
-                right = center_x + crop_w / 2
-                bottom = center_y + crop_h / 2
-                
-                # Clamping? PIL crop handles partially out of bounds?
-                # Better to keep aspect ratio or allow free pan?
-                # Let's clean up coordinate math:
-                # Pan 0,0 is center. -1 is left edge touches center? No.
-                # Let's map Pan -1..1 to moving the center across the image width/height?
-                
-                # Simple Clamp
-                left = max(0, min(left, w - crop_w))
-                top = max(0, min(top, h - crop_h))
-                
-                pil_crop = pil_img.crop((left, top, left + crop_w, top + crop_h))
-                
-                # Upscale to target
-                target_width = 2000
-                scale = max(1.0, target_width / float(crop_w))
-                new_size = (int(crop_w * scale), int(crop_h * scale))
-                
-                pil_crop = pil_crop.resize(new_size, Image.NEAREST)
-                upscaled_arr = np.array(pil_crop)
-                
-                self._modal_image_handle.image = upscaled_arr
+                try:
+                    # Crop logic
+                    pil_img = Image.fromarray(self._current_img_array)
+                    w, h = pil_img.size
+                    
+                    zoom = self._modal_zoom.value
+                    center_x = w / 2 * (1 + self._modal_pan_x.value)
+                    center_y = h / 2 * (1 + self._modal_pan_y.value)
+                    
+                    crop_w = w / zoom
+                    crop_h = h / zoom
+                    
+                    left = center_x - crop_w / 2
+                    top = center_y - crop_h / 2
+                    
+                    # Simple Clamp
+                    left = max(0, min(left, w - crop_w))
+                    top = max(0, min(top, h - crop_h))
+                    
+                    pil_crop = pil_img.crop((left, top, left + crop_w, top + crop_h))
+                    
+                    # Upscale to target
+                    target_width = 2000
+                    scale = max(1.0, target_width / float(crop_w))
+                    new_size = (int(crop_w * scale), int(crop_h * scale))
+                    
+                    pil_crop = pil_crop.resize(new_size, Image.NEAREST)
+                    upscaled_arr = np.array(pil_crop)
+                    
+                    self._modal_image_handle.image = upscaled_arr
+                except Exception as e:
+                    # Modal was closed or handle became invalid
+                    pass
 
-            with event.client.add_modal("Fullscreen View") as modal:
+            # If a modal is already open, close it before creating a new one.
+            try:
+                if self._modal_handle is not None:
+                    self._modal_handle.close()
+            except Exception:
+                pass
+
+            with event.client.gui.add_modal("Fullscreen View") as modal:
+                self._modal_handle = modal
+
                 # Add Image natively (placeholder, updated immediately)
                 self._modal_image_handle = event.client.gui.add_image(
                     self._current_img_array, # temporary
@@ -432,26 +481,92 @@ class ObjectManager:
                     self._modal_pan_y = event.client.gui.add_slider("Pan Y", min=-1.0, max=1.0, step=0.01, initial_value=0.0)
                     
                     play_btn = event.client.gui.add_button("Play", icon=viser.Icon.PLAYER_PLAY)
-                    pause_btn = event.client.gui.add_button("Pause", icon=viser.Icon.PLAYER_PAUSE)
+                    pause_btn = event.client.gui.add_button("Pause", icon=viser.Icon.PLAYER_PAUSE, visible=False)
                     close_btn = event.client.gui.add_button("Close", icon=viser.Icon.X)
 
-                    # Link controls
-                    self._modal_slider_handle.on_update(lambda _: setattr(self._image_slider, 'value', self._modal_slider_handle.value))
+                    # Store handles for syncing with main playback buttons.
+                    self._modal_play_btn = play_btn
+                    self._modal_pause_btn = pause_btn
+
+                    # Initialize modal buttons to match current playback state.
+                    if self._playing:
+                        play_btn.visible = False
+                        pause_btn.visible = True
+                    else:
+                        play_btn.visible = True
+                        pause_btn.visible = False
+
+                    # Capture handles in local variables for safe callback access
+                    modal_slider = self._modal_slider_handle
+                    main_slider = self._image_slider
+                    
+                    # Link modal slider to main slider AND update view
+                    def _on_modal_slider_change(_):
+                        # If the main UI is syncing the modal slider, don't reflect back.
+                        if getattr(self, "_syncing_modal_slider", False):
+                            _update_view()
+                            return
+
+                        # Update main slider (which triggers _update_image)
+                        main_slider.value = modal_slider.value
+                        # Also update the modal view immediately
+                        _update_view()
+                    
+                    modal_slider.on_update(_on_modal_slider_change)
                     
                     # Update view on zoom/pan
                     self._modal_zoom.on_update(lambda _: _update_view())
                     self._modal_pan_x.on_update(lambda _: _update_view())
                     self._modal_pan_y.on_update(lambda _: _update_view())
                     
-                    play_btn.on_click(lambda _: self._on_play(None))
-                    pause_btn.on_click(lambda _: self._on_pause(None))
-                    close_btn.on_click(lambda _: modal.close())
+                    # Modal-specific play/pause handlers that manage modal button visibility
+                    def _modal_play(_):
+                        self._playing = True
+                        play_btn.visible = False
+                        pause_btn.visible = True
+
+                        # Sync main controls.
+                        self._play_button.visible = False
+                        self._pause_button.visible = True
                     
-                    # Store update function for external sync?
+                    def _modal_pause(_):
+                        self._playing = False
+                        play_btn.visible = True
+                        pause_btn.visible = False
+
+                        # Sync main controls.
+                        self._play_button.visible = True
+                        self._pause_button.visible = False
+                    
+                    play_btn.on_click(_modal_play)
+                    pause_btn.on_click(_modal_pause)
+
+                    def _close_modal(_):
+                        try:
+                            modal.close()
+                        finally:
+                            # Cleanup after modal closes.
+                            self._modal_handle = None
+                            self._modal_image_handle = None
+                            self._modal_slider_handle = None
+                            self._modal_update_func = None
+                            self._modal_zoom = None
+                            self._modal_pan_x = None
+                            self._modal_pan_y = None
+                            self._modal_play_btn = None
+                            self._modal_pause_btn = None
+
+                    close_btn.on_click(_close_modal)
+                    
+                    # Store update function for external sync
                     self._modal_update_func = _update_view
                     
                     # Initial update
                     _update_view()
+
+                    # Note: the modal context manager only scopes *where GUI elements are added*.
+                    # We keep handles alive until the user clicks our Close button (or until an
+                    # update throws and we clear stale handles in the exception handler).
 
     def _sync_modal(self):
         pass
@@ -696,21 +811,29 @@ class ObjectManager:
             
             # Sync Modal if open
             try:
-                if hasattr(self, "_modal_image_handle") and self._modal_image_handle is not None:
-                    # Sync Slider if loop updated it
+                if hasattr(self, "_modal_update_func") and self._modal_update_func is not None:
+                    # Update modal slider position and refresh the modal image.
                     if hasattr(self, "_modal_slider_handle") and self._modal_slider_handle is not None:
-                        if self._modal_slider_handle.value != int(self._image_slider.value):
-                            self._modal_slider_handle.value = int(self._image_slider.value)
-                            
-                    # Trigger view update (which handles cropping and setting image)
-                    if hasattr(self, "_modal_update_func"):
-                        self._modal_update_func()
+                        current_frame = int(self._image_slider.value)
+                        if self._modal_slider_handle.value != current_frame:
+                            self._syncing_modal_slider = True
+                            try:
+                                self._modal_slider_handle.value = current_frame
+                            finally:
+                                self._syncing_modal_slider = False
+                    
+                    # Always trigger view update to refresh the modal image with new frame
+                    self._modal_update_func()
                         
-            except Exception:
+            except Exception as e:
                     # Handle invalidated handles (modal closed)
+                    print(f"Modal sync error: {e}")
                     self._modal_image_handle = None
                     self._modal_slider_handle = None
                     self._modal_update_func = None
+                    self._modal_zoom = None
+                    self._modal_pan_x = None
+                    self._modal_pan_y = None
             
             # 3D Scene Image
             if self._show_3d_image.value:
@@ -984,6 +1107,8 @@ class LayerHandle:
             self._parent_callback = lambda: None
         self._server = server
         self._object_manager = None # Will be set if passed
+        self._G = G  # Store graph reference for labelspace access
+        self._layer = layer  # Store layer reference
 
 
         self._folder = server.gui.add_folder(self.name, expand_by_default=False)
@@ -1008,6 +1133,9 @@ class LayerHandle:
             self._draw_bboxes = server.gui.add_checkbox(
                 "draw_bboxes", initial_value=config.draw_bboxes
             )
+            self._draw_bbox_labels = server.gui.add_checkbox(
+                "draw_bbox_labels", initial_value=False
+            )
             
             # Special: Path drawing for Agents
             self._draw_path = None
@@ -1023,6 +1151,7 @@ class LayerHandle:
         self._bbox_lines_handle = None
         self._bbox_hitbox_handle = None
         self._bbox_id_map = [] # List of nodes corresponding to batched indices
+        self._bbox_label_handles = [] # List of label handles for bounding boxes
 
         self._label_info = []
         self._label_handles = []
@@ -1090,6 +1219,7 @@ class LayerHandle:
         self._node_scale.on_update(lambda _: self._update())
         self._edge_scale.on_update(lambda _: self._update())
         self._draw_bboxes.on_update(lambda _: self._update())
+        self._draw_bbox_labels.on_update(lambda _: self._update())
 
     def set_object_manager(self, manager):
         self._object_manager = manager
@@ -1107,7 +1237,9 @@ class LayerHandle:
         draw_edges = self._draw_nodes.value and self._draw_edges.value
         draw_labels = self._draw_nodes.value and self._draw_labels.value
         draw_bboxes = self._draw_nodes.value and self._draw_bboxes.value
+        draw_bbox_labels = self._draw_nodes.value and self._draw_bboxes.value and self._draw_bbox_labels.value
         labels_drawn = len(self._label_handles) > 0
+        bbox_labels_drawn = len(self._bbox_label_handles) > 0
 
         self._nodes.visible = self._draw_nodes.value
         self._nodes.point_size = self._node_scale.value
@@ -1132,7 +1264,15 @@ class LayerHandle:
              self._bbox_lines_handle.visible = draw_bboxes
         if self._bbox_hitbox_handle:
              self._bbox_hitbox_handle.visible = draw_bboxes
-
+        
+        # Toggle BBox Labels visibility
+        if not draw_bbox_labels and bbox_labels_drawn:
+            for label in self._bbox_label_handles:
+                label.remove()
+            self._bbox_label_handles = []
+        
+        if draw_bbox_labels and not bbox_labels_drawn:
+            self._create_bbox_labels()
 
         self._parent_callback()
 
@@ -1145,6 +1285,11 @@ class LayerHandle:
         if self._bbox_hitbox_handle:
             self._bbox_hitbox_handle.remove()
             self._bbox_hitbox_handle = None
+        
+        # Clear bbox labels
+        for label in self._bbox_label_handles:
+            label.remove()
+        self._bbox_label_handles = []
             
         self._bbox_id_map = []
         
@@ -1253,6 +1398,58 @@ class LayerHandle:
             node = self._bbox_id_map[idx]
             if self._object_manager:
                 self._object_manager.handle_click(node)
+    
+    def _create_bbox_labels(self):
+        """Create labels above each bounding box showing object name/ID."""
+        # Get labelspace once for efficiency
+        labelspace = self._G.get_labelspace(self.key.layer, self.key.partition) if self._G else None
+        
+        # Prepare all label data first (fast)
+        label_data = []
+        for node in self._bbox_id_map:
+            if not hasattr(node.attributes, "bounding_box"):
+                continue
+            
+            bbox = node.attributes.bounding_box
+            if not bbox.is_valid():
+                continue
+            
+            try:
+                # Calculate position above the bounding box
+                center = np.array(bbox.world_P_center)
+                dims = np.array(bbox.dimensions)
+                # Position label above the top of the bbox
+                label_pos = center.copy()
+                label_pos[2] = center[2] + dims[2] / 2.0 + 0.3  # 0.3m above bbox top
+                
+                # Create label text - show ID with name/category if available
+                label_text = str(node.id)
+                if hasattr(node.attributes, "name") and node.attributes.name:
+                    safe_name = str(node.attributes.name)[:20]  # Truncate long names
+                    label_text = f"{node.id} ({safe_name})"
+                elif labelspace:
+                    category = labelspace.get_node_category(node)
+                    if category:
+                        label_text = f"{node.id} ({category})"
+                
+                label_data.append((node.id, label_text, label_pos))
+                
+            except Exception as e:
+                print(f"Error preparing bbox label for {node.id}: {e}")
+                continue
+        
+        # Batch create all labels at once (viser will handle efficiently)
+        with self._server.atomic():
+            for node_id, label_text, label_pos in label_data:
+                try:
+                    label_handle = self._server.scene.add_label(
+                        f"{self.name}_bbox_label_{node_id}",
+                        text=label_text,
+                        position=label_pos
+                    )
+                    self._bbox_label_handles.append(label_handle)
+                except Exception as e:
+                    print(f"Error creating bbox label for {node_id}: {e}")
 
 
     def remove(self):
@@ -1265,6 +1462,11 @@ class LayerHandle:
             x.remove()
 
         self._label_handles = []
+        
+        for label in self._bbox_label_handles:
+            label.remove()
+        
+        self._bbox_label_handles = []
 
         self._draw_nodes.remove()
         self._draw_edges.remove()
