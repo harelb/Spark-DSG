@@ -235,6 +235,7 @@ class ObjectManager:
             self._toggle_mesh = server.gui.add_checkbox("Show Object Mesh", initial_value=True)
             self._toggle_bbox_2d = server.gui.add_checkbox("Show 2D BBox", initial_value=True)
             self._show_mask = server.gui.add_checkbox("Show Mask", initial_value=False)
+            self._display_mode = server.gui.add_dropdown("Display Mode", options=["RGB", "Depth", "Both"], initial_value="RGB")
             self._show_3d_image = server.gui.add_checkbox("Show 3D Image", initial_value=True)
             self._maximize_2d = server.gui.add_checkbox("Maximize 2D Image", initial_value=False)
             
@@ -257,7 +258,10 @@ class ObjectManager:
 
         self._current_node = None
         self._node_map = {} # label -> node_id
-        self._current_images = [] # List of (image_path, meta_path, mask_path)
+        self._current_node = None
+        self._node_map = {} # label -> node_id
+        self._current_images = [] # List of (image_path, depth_path, meta_path, mask_path)
+        self._current_img_array = None # Cache for modal
         self._current_img_array = None # Cache for modal
         self._playing = False
         self._playback_thread = None
@@ -282,6 +286,7 @@ class ObjectManager:
         self._toggle_mesh.on_update(self._on_view_update)
         self._toggle_bbox_2d.on_update(self._on_view_update)
         self._show_mask.on_update(self._on_view_update)
+        self._display_mode.on_update(self._on_view_update)
         self._show_3d_image.on_update(self._on_view_update)
         self._maximize_2d.on_update(self._on_view_update)
         
@@ -457,7 +462,13 @@ class ObjectManager:
             except Exception:
                 pass
 
-            with event.client.gui.add_modal("Fullscreen View") as modal:
+            # Get title with object name and class/ID
+            title = "Fullscreen View"
+            if self._current_node:
+                obj_name = self._get_object_label(self._current_node)
+                title = f"{obj_name} ({self._current_node.id})"
+
+            with event.client.gui.add_modal(title) as modal:
                 self._modal_handle = modal
 
                 # Add Image natively (placeholder, updated immediately)
@@ -479,6 +490,28 @@ class ObjectManager:
                     self._modal_zoom = event.client.gui.add_slider("Zoom", min=1.0, max=10.0, step=0.1, initial_value=1.0)
                     self._modal_pan_x = event.client.gui.add_slider("Pan X", min=-1.0, max=1.0, step=0.01, initial_value=0.0)
                     self._modal_pan_y = event.client.gui.add_slider("Pan Y", min=-1.0, max=1.0, step=0.01, initial_value=0.0)
+                    
+                    # Add Visual Controls (Synced)
+                    # We initialize with current values
+                    m_bbox = event.client.gui.add_checkbox("Show 2D BBox", initial_value=self._toggle_bbox_2d.value)
+                    m_mask = event.client.gui.add_checkbox("Show Mask", initial_value=self._show_mask.value)
+                    m_mode = event.client.gui.add_dropdown("Display Mode", options=["RGB", "Depth", "Both"], initial_value=self._display_mode.value)
+                    
+                    # Callbacks to sync to main controls
+                    # Updating main controls will trigger _on_view_update -> _update_image -> _modal_update_func
+                    
+                    def _sync_bbox(_):
+                        self._toggle_bbox_2d.value = m_bbox.value
+                        
+                    def _sync_mask(_):
+                         self._show_mask.value = m_mask.value
+                         
+                    def _sync_mode(_):
+                         self._display_mode.value = m_mode.value
+                         
+                    m_bbox.on_update(_sync_bbox)
+                    m_mask.on_update(_sync_mask)
+                    m_mode.on_update(_sync_mode)
                     
                     play_btn = event.client.gui.add_button("Play", icon=viser.Icon.PLAYER_PLAY)
                     pause_btn = event.client.gui.add_button("Pause", icon=viser.Icon.PLAYER_PAUSE, visible=False)
@@ -738,6 +771,7 @@ class ObjectManager:
             return
 
         image_path = None
+        depth_path = None
         meta_path = None
         mask_path = None
 
@@ -746,47 +780,147 @@ class ObjectManager:
             # Ensure valid index
             idx = max(0, min(idx, len(self._current_images) - 1))
             if idx < len(self._current_images):
-                image_path, meta_path, mask_path = self._current_images[idx]
+                image_path, depth_path, meta_path, mask_path = self._current_images[idx]
         
+        # If RGB required but missing, return (unless handle depth only mode)
+        # We can handle depth-only if image_path is None but depth_path exists? 
+        # For now assume RGB always exists if we found it.
         if not image_path:
             return
             
         try:
-            # Use Cached Loader
-            img_array_base = load_and_process_image(str(image_path), max_dim=1024)
-            if img_array_base is None:
-                return
-
-            pil_image = Image.fromarray(img_array_base)
+            mode = self._display_mode.value
             
-            # Apply Mask if requested and available
-            if self._show_mask.value and mask_path and mask_path.exists():
+            # --- Prepare RGB ---
+            pil_rgb = None
+            if mode in ["RGB", "Both"] and image_path:
+                img_array_base = load_and_process_image(str(image_path), max_dim=1024)
+                if img_array_base is not None:
+                    pil_rgb = Image.fromarray(img_array_base)
+                    
+                    # Apply Mask/BBox to RGB
+                    self._process_single_image_view(pil_rgb, mask_path, meta_path, original_size=self._get_original_size(image_path))
+
+            # --- Prepare Depth ---
+            pil_depth = None
+            if mode in ["Depth", "Both"] and depth_path and depth_path.exists():
                 try:
-                    # Masks are usually small/compressible, maybe cache too? 
-                    # For now just load.
-                    mask_img = Image.open(mask_path).convert("L")
-                    
-                    # Resize mask to match base image (which might have been resized)
-                    if mask_img.size != pil_image.size:
-                        mask_img = mask_img.resize(pil_image.size, Image.NEAREST)
-                    
-                    # Create red overlay
-                    color_layer = Image.new("RGBA", pil_image.size, (255, 0, 0, 100))
-                    
-                    # Composite
-                    pil_image = pil_image.convert("RGBA")
-                    pil_image = Image.composite(color_layer, pil_image, mask_img)
+                    # Depth is likely 16-bit or just grayscale png.
+                    # Load as is
+                    with Image.open(depth_path) as d_img:
+                        # Convert to numpy array directly to handle all modes (I;16, I, F, L) robustly
+                        arr = np.array(d_img)
+                        
+                        # Handle potential float/int types
+                        # If image is float or large integer, we need to normalize.
+                        # If it's already uint8 (L), we might still want to stretch contrast if it's dark?
+                        # E.g. if max is 50, it looks black.
+                        
+                        # Robust normalization:
+                        # 1. Ignore 0s (often invalid/mask) for min calculation if possible
+                        valid_mask = arr > 0
+                        if valid_mask.any():
+                            # Use percentiles to robustly find range
+                            # 2% and 98% to avoid salt/pepper noise outliers
+                            d_min = np.percentile(arr[valid_mask], 2)
+                            d_max = np.percentile(arr[valid_mask], 98)
+                        else:
+                            d_min, d_max = arr.min(), arr.max()
+                            
+                        # Avoid div by zero
+                        if d_max > d_min:
+                            # Clip to range
+                            arr_clipped = np.clip(arr, d_min, d_max)
+                            # Normalize to 0-255
+                            arr_norm = ((arr_clipped - d_min) / (d_max - d_min) * 255.0)
+                            arr = arr_norm.astype(np.uint8)
+                        else:
+                            # If flat, just map to 0 or something visible? 
+                            # If all 0, keep 0. If all 1000, maybe make it 128? 
+                            # If valid_mask is empty, it's all 0s.
+                            if not valid_mask.any():
+                                arr = np.zeros_like(arr, dtype=np.uint8)
+                            else:
+                                # All same non-zero value -> make it grey
+                                arr = np.full_like(arr, 128, dtype=np.uint8)
+
+                        # If there were 0s originally that we want to keep black (invalid),
+                        # the clip/norm might have raised them if min < 0 (unlikely for depth).
+                        # But usually valid depth > 0. 
+                        # If we want 0 input to stay 0 output (black background):
+                        if valid_mask.any():
+                             # Ensure original 0s stay 0 (black)
+                             # Create mask where original was <= 0 (or close to 0 for float)
+                             invalid_mask = arr < (0.1 if d_img.mode in ['F', 'I'] else 1) 
+                             # Wait, 'arr' is already overwritten by float norm? No, arr_norm is new float.
+                             # We should apply mask to result.
+                             # Actually simpler: re-apply 0 where input was 0.
+                             # But 'arr' variable was reused. Let's fix that logic flow.
+                             pass 
+                             
+                        # Re-do logic cleanly:
+                        arr_f = np.array(d_img).astype(np.float32)
+                        valid_mask = arr_f > 0
+                        
+                        if valid_mask.any():
+                            v_vals = arr_f[valid_mask]
+                            d_min = np.percentile(v_vals, 2)
+                            d_max = np.percentile(v_vals, 98)
+                            
+                            if d_max > d_min:
+                                norm = (arr_f - d_min) / (d_max - d_min)
+                                norm = np.clip(norm, 0, 1)
+                                arr_u8 = (norm * 255.0).astype(np.uint8)
+                            else:
+                                arr_u8 = np.full_like(arr_f, 128, dtype=np.uint8)
+                                
+                            # Force invalid pixels to black
+                            arr_u8[~valid_mask] = 0
+                        else:
+                            arr_u8 = np.zeros_like(arr_f, dtype=np.uint8)
+                            
+                        pil_depth = Image.fromarray(arr_u8).convert("RGB")
+                            
+                    # Resize depth to match RGB if both are present
+                    if pil_rgb and pil_depth.size != pil_rgb.size:
+                        pil_depth = pil_depth.resize(pil_rgb.size, Image.NEAREST)
+                        
+                    # Apply Mask/BBox to Depth
+                    # Use same meta/mask path
+                    self._process_single_image_view(pil_depth, mask_path, meta_path, original_size=self._get_original_size(image_path)) # Use RGB orig size for scale ref?
                     
                 except Exception as e:
-                    print(f"Error applying mask: {e}")
+                    print(f"Error loading depth: {e}")
 
-            # Draw BBox if requested
-            if self._toggle_bbox_2d.value and meta_path and meta_path.exists():
-                # We need to scale bbox if we resized image!
-                self._draw_2d_bbox(pil_image, meta_path, original_size=self._get_original_size(image_path))
+            # --- Combine ---
+            final_pil = None
+            
+            if mode == "RGB":
+                final_pil = pil_rgb
+            elif mode == "Depth":
+                final_pil = pil_depth if pil_depth else pil_rgb # Fallback
+            elif mode == "Both":
+                if pil_rgb and pil_depth:
+                    # Side by side
+                    w1, h1 = pil_rgb.size
+                    w2, h2 = pil_depth.size
+                    # Assume same height (resized above)
+                    total_w = w1 + w2
+                    max_h = max(h1, h2)
+                    
+                    final_pil = Image.new("RGB", (total_w, max_h))
+                    final_pil.paste(pil_rgb, (0, 0))
+                    final_pil.paste(pil_depth, (w1, 0))
+                elif pil_rgb:
+                    final_pil = pil_rgb
+                elif pil_depth:
+                     final_pil = pil_depth
+
+            if not final_pil:
+                return
 
             # Convert to numpy for viser
-            img_array_final = np.array(pil_image.convert("RGB"))
+            img_array_final = np.array(final_pil)
             self._current_img_array = img_array_final # Cache for modal
             
             # Retrieve Object Name
@@ -990,29 +1124,36 @@ class ObjectManager:
             # Meta file
             meta_file = None
             mask_file = None
+            depth_file = None
+            
             if len(parts) >= 3:
                  # Reconstruct base name? 
                  # frame_TS_meta.json
-                 meta_name = f"frame_{parts[1]}_meta.json"
+                 ts_str = parts[1]
+                 meta_name = f"frame_{ts_str}_meta.json"
                  meta_file = folder_path / meta_name
 
                  # Mask file
-                 mask_name = f"frame_{parts[1]}_mask.png"
+                 mask_name = f"frame_{ts_str}_mask.png"
                  mask_file = folder_path / mask_name
                  
-            parsed_images.append((ts, img, meta_file, mask_file))
+                 # Depth file
+                 depth_name = f"frame_{ts_str}_depth.png"
+                 depth_file = folder_path / depth_name
+                 
+            parsed_images.append((ts, img, depth_file, meta_file, mask_file))
             
         # Sort by timestamp
         parsed_images.sort(key=lambda x: x[0])
         
-        return [(x[1], x[2], x[3]) for x in parsed_images]
+        return [(x[1], x[2], x[3], x[4]) for x in parsed_images]
 
     def _find_image_paths(self, node):
         # Legacy wrapper or just use first of all images
         all_imgs = self._find_all_images(node)
         if all_imgs:
-            # Return path/meta only to match signature if used elsewhere, or just full tuple?
-            return all_imgs[0][0], all_imgs[0][1]
+            # Unpack: path, depth, meta, mask
+            return all_imgs[0][0], all_imgs[0][2]
         return None, None
 
     def _get_original_size(self, path):
@@ -1053,6 +1194,37 @@ class ObjectManager:
                     draw.rectangle([min_x, min_y, max_x, max_y], outline="red", width=3)
         except Exception as e:
             print(f"Error reading meta for bbox: {e}")
+
+    def _process_single_image_view(self, pil_image, mask_path, meta_path, original_size=None):
+        """Helper to apply mask and bbox to a single PIL image in-place."""
+        # Apply Mask if requested and available
+        if self._show_mask.value and mask_path and mask_path.exists():
+            try:
+                mask_img = Image.open(mask_path).convert("L")
+                
+                # Resize mask to match base image
+                if mask_img.size != pil_image.size:
+                    mask_img = mask_img.resize(pil_image.size, Image.NEAREST)
+                
+                # Create red overlay
+                color_layer = Image.new("RGBA", pil_image.size, (255, 0, 0, 100))
+                
+                # Composite
+                # Ensure base is RGBA
+                if pil_image.mode != "RGBA":
+                    pil_image_rgba = pil_image.convert("RGBA")
+                    pil_image.paste(Image.composite(color_layer, pil_image_rgba, mask_img), (0,0))
+                else:
+                    # In-place paste not easy with composite returning new, so paste over
+                    composite = Image.composite(color_layer, pil_image, mask_img)
+                    pil_image.paste(composite, (0, 0))
+                
+            except Exception as e:
+                print(f"Error applying mask: {e}")
+
+        # Draw BBox if requested
+        if self._toggle_bbox_2d.value and meta_path and meta_path.exists():
+             self._draw_2d_bbox(pil_image, meta_path, original_size=original_size)
 
 
 @dataclass
@@ -1598,7 +1770,7 @@ class ViserRenderer:
     """Rendering interface to Viser client."""
 
     def __init__(self, ip="localhost", port=8080, clear_at_exit=True, image_root=None, image_folder_prefix=None):
-        self._server = viser.ViserServer(host=ip, port=port)
+        self._server = viser.ViserServer(host=ip, port=int(port))
         self._clear_at_exit = clear_at_exit
         self._mesh_handle = None
         self._graph_handle = None
