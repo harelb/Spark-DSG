@@ -183,10 +183,11 @@ class FlatGraphView:
 
 
 class ObjectManager:
-    def __init__(self, server, G, image_root=None):
+    def __init__(self, server, G, image_root=None, image_folder_prefix=None):
         self._server = server
         self._G = G
         self._image_root = Path(image_root) if image_root else None
+        self._image_folder_prefix = Path(image_folder_prefix) if image_folder_prefix else None
         
         # Create image container first so it appears at the top
         self._image_container = server.gui.add_folder("Selected Image")
@@ -807,12 +808,19 @@ class ObjectManager:
         
         if not hasattr(node.attributes, "image_folder"):
             return images_list
-            
-        folder = node.attributes.image_folder
-        if not folder:
-            return images_list
-            
-        folder_path = Path(folder)
+
+        folder_path = None
+        if self._image_folder_prefix:
+             prefix_path = self._image_folder_prefix / f"O_{node.id.category_id}"
+             if prefix_path.exists():
+                 folder_path = prefix_path
+
+        if not folder_path:
+            folder = node.attributes.image_folder
+            if not folder:
+                return images_list
+            folder_path = Path(folder)
+
         if self._image_root:
             if not folder_path.is_absolute():
                 folder_path = self._image_root / folder_path
@@ -1387,12 +1395,13 @@ class MeshHandle:
 class ViserRenderer:
     """Rendering interface to Viser client."""
 
-    def __init__(self, ip="localhost", port=8080, clear_at_exit=True, image_root=None):
+    def __init__(self, ip="localhost", port=8080, clear_at_exit=True, image_root=None, image_folder_prefix=None):
         self._server = viser.ViserServer(host=ip, port=port)
         self._clear_at_exit = clear_at_exit
         self._mesh_handle = None
         self._graph_handle = None
         self._image_root = image_root
+        self._image_folder_prefix = image_folder_prefix
         self._object_manager = None
 
 
@@ -1410,7 +1419,7 @@ class ViserRenderer:
 
     def draw(self, G, height_scale=5.0):
         self._clear_graph()
-        self._object_manager = ObjectManager(self._server, G, self._image_root)
+        self._object_manager = ObjectManager(self._server, G, self._image_root, self._image_folder_prefix)
         self._graph_handle = GraphHandle(self._server, G, height_scale=height_scale, object_manager=self._object_manager)
 
         if G.has_mesh():
