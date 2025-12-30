@@ -49,6 +49,8 @@ class ColorMode(enum.Enum):
     ID = "id"
     LABEL = "label"
     PARENT = "parent"
+    HEIGHT = "height"
+    INSTANCE = "instance"
 
 
 def _layer_name(layer_key):
@@ -95,9 +97,93 @@ def color_from_parent(G, node, parent_func, default=None):
 def color_from_layer(G, node):
     return dsg.rainbow_color(node.layer.layer)
 
+def color_from_height(G, node, min_z=0.0, max_z=1.0):
+    pos = node.attributes.position
+    z = pos[2]
+    # Normalize
+    t = (z - min_z) / (max_z - min_z + 1e-6)
+    t = max(0.0, min(1.0, t))
+    
+    # Simple heatmap: Blue -> Green -> Red
+    # Or use matplotlib/turbo if available? checking imports... only numpy/trimesh
+    # Custom simple heatmap
+    r = g = b = 0.0
+    if t < 0.5:
+        # Blue to Green
+        v = t * 2.0
+        b = 1.0 - v
+        g = v
+    else:
+        # Green to Red
+        v = (t - 0.5) * 2.0
+        g = 1.0 - v
+        r = v
+        
+    c = dsg.Color()
+    c.r = int(r*255)
+    c.g = int(g*255)
+    c.b = int(b*255)
+    return c
+    
+def color_from_instance(G, node):
+    # Hash ID to color
+    import hashlib
+    h = hashlib.md5(str(node.id.value).encode()).hexdigest()
+    # take first 6 chars for RGB
+    r = int(h[0:2], 16)
+    g = int(h[2:4], 16)
+    b = int(h[4:6], 16)
+    
+    c = dsg.Color()
+    c.r = r
+    c.g = g
+    c.b = b
+    return c
 
-def colormap_from_modes(key_to_mode, default_colors=None):
+
+def colormap_from_modes(G, key_to_mode, default_colors=None):
     colormap = {}
+    
+    # Pre-calculate stats for height mode if needed
+    layer_stats = {}
+    
+    for layer_key, mode in key_to_mode.items():
+        if mode == ColorMode.HEIGHT:
+            # Find min/max z for this layer
+            # Access G.get_layer(layer_key.layer, layer_key.partition).nodes...
+            # This might be slow for huge graphs?
+            # But we only do it once at startup/refresh.
+            try:
+                layer = None
+                if layer_key.layer in G.layers: 
+                   # This access pattern depends on bindings. 
+                   # Iterating nodes to find bounds
+                   # Let's try to get G's layer object
+                   # G.layers is iterator.
+                   # Assuming we can iterate.
+                   zs = []
+                   # Helper to find layer
+                   target_layer = None
+                   # G.layers is a property returning list of layers?
+                   # Iterate all layers
+                   found = False
+                   for l in itertools.chain(G.layers, G.layer_partitions):
+                       if l.key == layer_key:
+                           target_layer = l
+                           found = True
+                           break
+                   
+                   if target_layer:
+                       for n in target_layer.nodes:
+                           zs.append(n.attributes.position[2])
+                   
+                   min_z = min(zs) if zs else 0.0
+                   max_z = max(zs) if zs else 1.0
+                   layer_stats[layer_key] = (min_z, max_z)
+            except:
+                layer_stats[layer_key] = (0.0, 1.0)
+                
+    
     for layer_key, mode in key_to_mode.items():
         default = default_colors.get(layer_key) if default_colors is not None else None
         if mode == ColorMode.ID:
@@ -105,11 +191,26 @@ def colormap_from_modes(key_to_mode, default_colors=None):
         elif mode == ColorMode.LABEL:
             colormap[layer_key] = functools.partial(color_from_label, default=default)
         elif mode == ColorMode.PARENT:
+            # Parent func needs recursion handling or similar logic
+            # This partial logic seems a bit circular if parent is same layer? usually parent is higher layer.
+            # We need simple lookup.
+            # Re-implementing to be robust:
+            # We defer binding parent colormap until execution? 
+            # Or assume parent uses default layer color?
+            # The original code:
+            # colormap[x.layer](G, x) -> Recurses.
+            # If parent has ColorMode.PARENT -> Infinite loop?
+            # Users shouldn't set top layer to Parent.
             colormap[layer_key] = functools.partial(
                 color_from_parent,
-                parent_func=lambda G, x: colormap[x.layer](G, x),
+                parent_func=lambda G, x: colormap.get(x.layer, color_from_layer)(G, x),
                 default=default,
             )
+        elif mode == ColorMode.HEIGHT:
+             min_z, max_z = layer_stats.get(layer_key, (0.0, 1.0))
+             colormap[layer_key] = functools.partial(color_from_height, min_z=min_z, max_z=max_z)
+        elif mode == ColorMode.INSTANCE:
+             colormap[layer_key] = color_from_instance
         else:
             colormap[layer_key] = color_from_layer
 
@@ -226,6 +327,19 @@ class ObjectManager:
 
         self._folder = server.gui.add_folder("Object Browser")
         with self._folder:
+            self._filter_input = server.gui.add_text("Filter", initial_value="")
+            
+            # Semantic Class Dropdown
+            # Collect unique labels from Objects layer
+            self._found_classes = self._scan_classes()
+            class_options = ["All"] + sorted(self._found_classes.keys())
+            
+            self._class_filter_dropdown = server.gui.add_dropdown(
+                "Class Filter",
+                options=class_options,
+                initial_value="All"
+            )
+
             self._object_dropdown = server.gui.add_dropdown(
                 "Object ID", 
                 options=["None"], 
@@ -278,17 +392,22 @@ class ObjectManager:
         # Guard to prevent modal slider sync from recursively updating the main slider.
         self._syncing_modal_slider = False
 
+        # Filter state for external consumers (e.g. BBox rendering)
+        self.filtered_ids = set() # Set of Node IDs that match current filter
+        self.on_filter_update = [] # List of callbacks
+
         # Modal-only UI handles (for syncing playback controls).
         self._modal_play_btn = None
         self._modal_pause_btn = None
         self._modal_handle = None
         
         # Populate dropdown
-        
-        # Populate dropdown
         self._update_dropdown()
         
         # Event callbacks
+        self._filter_input.on_update(lambda _: self._update_dropdown())
+        self._class_filter_dropdown.on_update(lambda _: self._update_dropdown())
+        
         self._object_dropdown.on_update(self._on_object_select)
         self._jump_button.on_click(self._on_jump)
         self._toggle_mesh.on_update(self._on_view_update)
@@ -311,30 +430,113 @@ class ObjectManager:
         if self._image_root:
             print(f"ObjectManager initialized with image_root: {self._image_root}")
 
+    def _scan_classes(self):
+        """Scan unique semantic labels in Object layer (Layer 2)."""
+        classes = {} # Name -> Label ID (or just use string matching if only names available)
+        # Actually mapping Name -> ID is better if we can get IDs easily.
+        # But we filter by parsing the label string or checking attributes?
+        # Checking attributes is robust.
+        
+        # NOTE: This assumes layer 2 is Objects.
+        # Should we genericize?
+        # Iterate all layers looking for object-like things?
+        
+        labelspace = None
+        # Try to get labelspace from graph for default layer (Objects = 2)
+        # Assuming G.get_labelspace(2, 0)
+        try:
+             # We need to find correct layer key.
+             # Just iterate nodes and collect unique semantic_labels
+            pass # We do it inside loop
+        except:
+            pass
+            
+        for layer in self._G.layers:
+             for node in layer.nodes:
+                 if hasattr(node.attributes, "semantic_label"):
+                     label = node.attributes.semantic_label
+                     # Get string representation
+                     # We need the labelspace for this layer
+                     # Optimally we cache labelspaces.
+                     # For now, just getting it from G each time or assuming global?
+                     # G.get_labelspace(layer.key.layer, layer.key.partition)
+                     lspace = self._G.get_labelspace(layer.key.layer, layer.key.partition)
+                     class_name = f"Class {label}"
+                     if lspace:
+                         res = lspace.get_category(label)
+                         if res:
+                             class_name = res
+                     
+                     classes[class_name] = label
+                     
+        return classes
+
     def _update_dropdown(self):
         options = ["None"]
         self._node_map = {}
+        query = self._filter_input.value.lower()
+        class_filter = self._class_filter_dropdown.value
+        
+        self.filtered_ids = set()
         
         object_nodes = []
         for layer in self._G.layers:
+            # Prepare labelspace lookup
+            lspace = self._G.get_labelspace(layer.key.layer, layer.key.partition)
+            
             for node in layer.nodes:
                 # Check if it looks like an object (has bounding box or image folder)
-                if hasattr(node.attributes, "bounding_box") or hasattr(node.attributes, "image_folder"):
-                     object_nodes.append(node)
+                is_obj = hasattr(node.attributes, "bounding_box") or hasattr(node.attributes, "image_folder")
+                if is_obj:
+                    # Semantic Filter
+                    if class_filter != "All":
+                        # Must match
+                        if hasattr(node.attributes, "semantic_label"):
+                             label_id = node.attributes.semantic_label
+                             name = f"Class {label_id}"
+                             if lspace:
+                                 res = lspace.get_category(label_id)
+                                 if res:
+                                     name = res
+                             
+                             if name != class_filter:
+                                 continue
+                        else:
+                             # No semantic label, but filter is active -> skip
+                             continue
+                    
+                    object_nodes.append(node)
                      
         # Sort by ID
         object_nodes.sort(key=lambda x: x.id.value)
         
+        filtered_list = []
         for node in object_nodes:
             label = f"{node.id}"
+            
+            name = ""
             if hasattr(node.attributes, "name") and node.attributes.name:
                 # Sanitize name to avoid JS issues
-                safe_name = str(node.attributes.name).replace('"', '').replace("'", "").replace("\\", "")
-                label += f" ({safe_name})"
+                name = str(node.attributes.name).replace('"', '').replace("'", "").replace("\\", "")
+                label += f" ({name})"
+            
+            # Text Filter
+            if query:
+                if query not in label.lower():
+                    continue
+
             options.append(label)
             self._node_map[label] = node.id.value
+            self.filtered_ids.add(node.id.value)
 
         self._object_dropdown.options = options
+        # Reset value if current is invalid, or keep if valid
+        if self._object_dropdown.value not in options:
+             self._object_dropdown.value = "None"
+             
+        # Notify listeners (e.g. for bbox filtering)
+        for cb in self.on_filter_update:
+            cb()
 
 
     def refresh(self):
@@ -1358,6 +1560,7 @@ DEFAULT_COLORMODES = {
 }
 
 
+
 @dataclass
 class LabelInfo:
     name: str
@@ -1365,11 +1568,156 @@ class LabelInfo:
     pos: np.ndarray
 
 
+class LabelPool:
+    """Manages a fixed pool of label handles to render only the nearest labels."""
+
+    def __init__(self, server, layer_name, max_labels=50):
+        self._server = server
+        self._max_labels = max_labels
+        self._handles = []
+        self._running = False
+        self._thread = None
+        self._items = [] # List of LabelInfo
+        self._layer_name = layer_name
+        self._lock = threading.Lock()
+        
+        # Create pool of handles (initially hidden)
+        with self._server.atomic():
+            for i in range(max_labels):
+                h = self._server.scene.add_label(
+                    f"{layer_name}_pool_{i}",
+                    text="",
+                    position=(0,0,0),
+                    visible=False
+                )
+                self._handles.append(h)
+
+    def set_items(self, items):
+        with self._lock:
+            self._items = items
+            
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._update_loop, daemon=True)
+        self._thread.start()
+        
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+            
+    def remove(self):
+        self.stop()
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+
+    def _update_loop(self):
+        while self._running:
+            try:
+                clients = self._server.get_clients()
+                if not clients:
+                    time.sleep(0.5)
+                    continue
+                
+                # Use the first client's camera
+                # TODO: Handle multiple clients better?
+                client = next(iter(clients.values()))
+                cam_pos = np.array(client.camera.position)
+                
+                with self._lock:
+                    items = self._items
+                    
+                if not items:
+                    # Hide all
+                    for h in self._handles:
+                        h.visible = False
+                    time.sleep(0.5)
+                    continue
+                    
+                # Sort by distance
+                # Optimization: Compute dists for all?
+                # If N is large (e.g. 5000), sorting is fast enough in Python (milliseconds).
+                
+                # Store (dist_sq, item)
+                # item.pos is np array
+                
+                # Vectorized distance calculation
+                # extracting positions into a matrix is faster
+                positions = np.array([item.pos for item in items])
+                diff = positions - cam_pos
+                dists_sq = np.sum(diff**2, axis=1)
+                
+                # Get indices of top K
+                # argpartition is faster than argsort for top K
+                k = min(len(items), self._max_labels)
+                nearest_indices = np.argpartition(dists_sq, k-1)[:k]
+                
+                # Now update handles
+                # We don't strictly need them sorted by distance, just the set of nearest.
+                
+                with self._server.atomic():
+                    for i, idx in enumerate(nearest_indices):
+                        item = items[idx]
+                        handle = self._handles[i]
+                        handle.text = item.text
+                        handle.position = item.pos
+                        handle.visible = True
+                        
+                    # Hide unused
+                    for i in range(k, self._max_labels):
+                        self._handles[i].visible = False
+                        
+                time.sleep(0.1) # 10Hz update
+                
+            except Exception as e:
+                # print(f"Label pool error: {e}")
+                time.sleep(1.0)
+
+
+
+class GraphStatistics:
+    """Displays real-time statistics about the scene graph."""
+    
+    def __init__(self, server, G):
+        self._server = server
+        self._G = G
+        self._markdown_handle = server.gui.add_markdown("Loading stats...")
+        self.update()
+        
+    def update(self):
+        # Calculate stats
+        lines = ["| Layer | Nodes | Edges |", "|---|---|---|"]
+        
+        total_nodes = 0
+        total_edges = 0
+        
+        for layer in itertools.chain(self._G.layers, self._G.layer_partitions):
+            name = _layer_name(layer.key)
+            n_nodes = layer.num_nodes()
+            n_edges = layer.num_edges()
+            
+            lines.append(f"| {name} | {n_nodes} | {n_edges} |")
+            
+            total_nodes += n_nodes
+            total_edges += n_edges
+            
+        lines.append(f"| **Total** | **{total_nodes}** | **{total_edges}** |")
+        
+        self._markdown_handle.content = "\n".join(lines)
+    
+    def remove(self):
+        self._markdown_handle.remove()
+
+
 class LayerHandle:
     """Viser handles to layer elements and gui settings."""
 
     def __init__(
-        self, server, config, colormap, height, G, layer, view, parent_callback
+        self, server, config, colormap, height, G, layer, view, parent_callback, object_manager=None
     ):
         """Add options for layer to viser."""
         self.key = layer.key
@@ -1380,12 +1728,15 @@ class LayerHandle:
         else:
             self._parent_callback = lambda: None
         self._server = server
-        self._object_manager = None # Will be set if passed
+        self._object_manager = object_manager # Store ref
         self._G = G  # Store graph reference for labelspace access
         self._layer = layer  # Store layer reference
         self._colormap = colormap
-
-
+        
+        # Subscribe to filter updates if available
+        if self._object_manager:
+            self._object_manager.on_filter_update.append(lambda: self._on_filter_update())
+            
         self._folder = server.gui.add_folder(self.name, expand_by_default=False)
             
         with self._folder:
@@ -1412,15 +1763,32 @@ class LayerHandle:
                 "draw_bbox_labels", initial_value=False
             )
             
-            # Special: Path drawing for Agents
-            self._draw_path = None
-            if layer.key.layer == 2: # Agents
-                 self._draw_path = server.gui.add_checkbox("draw_path", initial_value=False)
-                 self._draw_path.on_update(lambda _: self._update())
+            # Color Mode Dropdown
+            color_options = [m.value for m in ColorMode]
+            # determine initial value
+            # We don't store the mode in config currently, just the function.
+            # We can default to Layer or Label depending on what maps to the current colormap?
+            # Hard to reverse map function. Let's just default to "Layer" or what is in config?
+            # We passed 'colormap' but not the mode enum that created it.
+            # Let's ignore that and just default to "Layer" or try to guess?
+            # Better: pass initial mode to __init__
+            self._color_mode_dropdown = server.gui.add_dropdown(
+                "Color Mode", 
+                options=color_options, 
+                initial_value=ColorMode.LAYER.value 
+            )
+            
+            self._color_mode_dropdown.on_update(self._on_colormode_change)
 
+        # Special: Path drawing for Agents
+        self._draw_path = None
+        self._path_handle = None
+        self._path_markers_handle = None
+        
+        if layer.key.layer == 2: # Agents
+             self._draw_path = server.gui.add_checkbox("draw_path", initial_value=False)
+             self._draw_path.on_update(lambda _: self._update())
 
-        self._nodes = None
-        self._edges = None
         self._nodes = None
         self._edges = None
         self._bbox_lines_handle = None
@@ -1430,6 +1798,7 @@ class LayerHandle:
 
         self._label_info = []
         self._label_handles = []
+        self._label_pool = None
         
         self._regenerate_geometry(view, height)
 
@@ -1440,6 +1809,9 @@ class LayerHandle:
         if self._path_handle:
             self._path_handle.remove()
             self._path_handle = None
+        if self._path_markers_handle:
+            self._path_markers_handle.remove()
+            self._path_markers_handle = None
             
         if self._draw_path and self._draw_path.value:
              try:
@@ -1447,16 +1819,28 @@ class LayerHandle:
                  # layer.nodes is list[SceneGraphNode]
                  sorted_nodes = sorted(layer.nodes, key=lambda n: n.id.value)
                  
-                 # Extract positions
-                 points = np.array([n.attributes.position for n in sorted_nodes])
-                 
-                 if len(points) >= 2:
+                 if len(sorted_nodes) >= 2:
+                     # Extract positions
+                     points = np.array([n.attributes.position for n in sorted_nodes])
+                     
                      self._path_handle = self._server.scene.add_line_strip(
                          f"{self.name}_path",
                          points,
-                         color=(0.0, 1.0, 0.0), # Green path? Or make configurable?
+                         color=(0.0, 1.0, 0.0), # Green path
                          line_width=3.0
                      )
+                     
+                     # Add Markers (Keyframes) at each node
+                     # Small spheres or coordinate frames
+                     # Let's use simple blue spheres for now
+                     self._path_markers_handle = self._server.scene.add_point_cloud(
+                         f"{self.name}_path_markers",
+                         points,
+                         colors=(0.0, 0.0, 1.0),
+                         point_size=0.1,
+                         point_shape="circle" 
+                     )
+                     
              except Exception as e:
                  print(f"Error drawing path: {e}")
 
@@ -1468,6 +1852,64 @@ class LayerHandle:
         self._edge_scale.on_update(lambda _: self._update())
         self._draw_bboxes.on_update(lambda _: self._update())
         self._draw_bbox_labels.on_update(lambda _: self._update())
+
+
+    def _on_colormode_change(self, event):
+        mode_str = self._color_mode_dropdown.value
+        try:
+            mode = ColorMode(mode_str)
+        except ValueError:
+            return
+            
+        # Re-create colormap function for this single layer
+        if mode == ColorMode.ID:
+            self._colormap = color_from_id
+        elif mode == ColorMode.LABEL:
+            self._colormap = functools.partial(color_from_label, default=None)
+        elif mode == ColorMode.PARENT:
+            # We need to recreate the parent logic.
+            # This is tricky because we need the PARENT layer's colormap.
+            # For now, let's use a simpler fallback or just the layer color of the parent.
+            self._colormap = functools.partial(
+                color_from_parent,
+                parent_func=lambda G, x: color_from_layer(G, x), # Fallback to layer color for parent
+                default=None,
+            )
+        elif mode == ColorMode.HEIGHT:
+            # Calculate stats for this layer
+            zs = []
+            for n in self._layer.nodes:
+                zs.append(n.attributes.position[2])
+            min_z = min(zs) if zs else 0.0
+            max_z = max(zs) if zs else 1.0
+            self._colormap = functools.partial(color_from_height, min_z=min_z, max_z=max_z)
+        elif mode == ColorMode.INSTANCE:
+            self._colormap = color_from_instance
+        else:
+            self._colormap = color_from_layer
+            
+        # Trigger geometry refresh
+        # We need view and height
+        # But refresh() requires them passed in.
+        # We can store them? Or...
+        # Wait, refresh() is called by GraphHandle.
+        # We can trigger a self update if we only change colors?
+        # _regenerate_geometry uses view.pos(). We don't have 'view' stored.
+        # We need to store 'view' and 'height' in __init__?
+        # Or we can just update the colors of the *existing* point cloud if point count hasn't changed?
+        
+        if self._nodes:
+            # Re-compute colors
+            colors = np.zeros((self._layer.num_nodes(), 3))
+            for idx, node in enumerate(self._layer.nodes):
+                colors[idx] = self._colormap(self._G, node).to_float_array()
+            
+            self._nodes.colors = colors
+            
+        # Update bounding boxes if visible
+        if self._draw_bboxes.value:
+            self._update_bboxes(self._G, self._layer)
+
 
     def refresh(self, view, height):
         self._regenerate_geometry(view, height)
@@ -1485,6 +1927,10 @@ class LayerHandle:
             x.remove()
         self._label_handles = []
         self._label_info = []
+        
+        if self._label_pool:
+            self._label_pool.remove()
+            self._label_pool = None
 
         pos = view.pos(self.key, height)
         if pos is None:
@@ -1509,6 +1955,11 @@ class LayerHandle:
             self._label_info.append(
                 LabelInfo(name=f"label_{node.id.str()}", text=text, pos=pos[idx])
             )
+
+        # Check if we should use pooling
+        if len(self._label_info) > 100: # Threshold for pooling
+             self._label_pool = LabelPool(self._server, self.name, max_labels=50) # Keep constant 50
+             self._label_pool.set_items(self._label_info)
 
         edge_indices = view.layer_edges(self.key)
         if edge_indices is not None:
@@ -1539,8 +1990,9 @@ class LayerHandle:
         labels_drawn = len(self._label_handles) > 0
         bbox_labels_drawn = len(self._bbox_label_handles) > 0
 
-        self._nodes.visible = self._draw_nodes.value
-        self._nodes.point_size = self._node_scale.value
+        if self._nodes:
+            self._nodes.visible = self._draw_nodes.value
+            self._nodes.point_size = self._node_scale.value
         if self._edges:
             self._edges.visible = draw_edges
             self._edges.line_width = self._edge_scale.value
@@ -1548,14 +2000,33 @@ class LayerHandle:
         if not draw_labels and labels_drawn:
             for x in self._label_handles:
                 x.remove()
-
             self._label_handles = []
 
-        if draw_labels and not labels_drawn:
-            self._label_handles = [
-                self._server.scene.add_label(x.name, x.text, position=x.pos)
-                for x in self._label_info
-            ]
+        if draw_labels:
+            if self._label_pool:
+                # Use pool
+                self._label_pool.start()
+            elif not labels_drawn:
+                # Static creation
+                self._label_handles = [
+                    self._server.scene.add_label(x.name, x.text, position=x.pos)
+                    for x in self._label_info
+                ]
+        else:
+            if self._label_pool:
+                self._label_pool.stop()
+                # Ensure they are hidden? stop() might leave them visible
+                # The loop hides them if stopped? No
+                # We should force hide.
+                # Actually, simplest is to let pool hide them or just rely on loop stopping.
+                # Let's add a hide method or just recreate?
+                # The pool object persists. 
+                # Let's manually hide handles in pool?
+                # Better: pool.stop() stops updates, but doesn't necessarily hide.
+                # We can access _handles.
+                for h in self._label_pool._handles:
+                     h.visible = False
+            
             
         # Toggle BBoxes visibility
         if self._bbox_lines_handle:
@@ -1589,7 +2060,7 @@ class LayerHandle:
             label.remove()
         self._bbox_label_handles = []
             
-        self._bbox_id_map = []
+        self._bbox_id_map = [] # Track which node each bbox corresponds to
         
         # Arrays for batching
         all_segments = []
@@ -1598,6 +2069,8 @@ class LayerHandle:
         hitbox_positions = []
         hitbox_wxyzs = []
         hitbox_scales = []
+
+        draw_labels = self._draw_bbox_labels.value
         
         # Standard unit cube wireframe edges (0..1)
         # However, we get absolute corners from C++. 
@@ -1605,17 +2078,26 @@ class LayerHandle:
         
         # spark_dsg bitwise corner ordering edges
         edges_bitwise = [
-            (0, 1), (0, 2), (0, 4),
-            (1, 3), (1, 5),
-            (2, 3), (2, 6),
-            (3, 7),
-            (4, 5), (4, 6),
-            (5, 7),
-            (6, 7)
+            (0, 1), (1, 2), (2, 3), (3, 0), # Bottom face
+            (4, 5), (5, 6), (6, 7), (7, 4), # Top face
+            (0, 4), (1, 5), (2, 6), (3, 7)  # Vertical pillars
         ]
+        
+        # Get active filter set if manager exists
+        active_filter = None
+        if self._object_manager:
+            active_filter = self._object_manager.filtered_ids
 
         for node in layer.nodes:
             if hasattr(node.attributes, "bounding_box"):
+                # Filter check
+                if active_filter is not None and len(active_filter) > 0:
+                    # If we have filters active (even if "All", filtered_ids contains matching)
+                    # Wait, if "All" and no text, filtered_ids has ALL objects.
+                    # So we just check membership.
+                     if node.id.value not in active_filter:
+                         continue
+                
                 bbox = node.attributes.bounding_box
                 if not bbox.is_valid():
                     continue
@@ -1631,8 +2113,8 @@ class LayerHandle:
                             all_segments.append(corners[start])
                             all_segments.append(corners[end])
                             
-                        # Color
-                        c = dsg.distinct_150_color(node.attributes.semantic_label).to_float_array() if hasattr(node.attributes, "semantic_label") else (1.0, 0.0, 0.0)
+                        # Color - Use the current colormap to match nodes
+                        c = self._colormap(self._G, node).to_float_array()
                         c_arr = np.array(c)
                         
                         # We need (12, 2, 3) for the 12 segments, 2 vertices each
@@ -1641,6 +2123,7 @@ class LayerHandle:
                         all_colors.append(box_colors)
 
                     # --- Hitbox Data ---
+                    # Only add if we need hitboxes (interactive)
                     dim = np.array(bbox.dimensions)
                     center = np.array(bbox.world_P_center)
                     R = np.array(bbox.world_R_center)
@@ -1650,6 +2133,21 @@ class LayerHandle:
                     hitbox_scales.append(dim)
                     
                     self._bbox_id_map.append(node)
+
+                    # --- Labels ---
+                    if draw_labels:
+                        pos = corners.mean(axis=0) # Center
+                        pos[2] = corners[:, 2].max() + 0.2 # Above box
+                        
+                        l_text = f"{node.id}"
+                        self._bbox_label_handles.append(
+                            self._server.scene.add_label(
+                                f"{self.name}_bbox_label_{node.id}",
+                                l_text,
+                                pos,
+                                font_size=0.5
+                            )
+                        )
 
                 except Exception as e:
                      print(f"Error preparing bbox batch for {node.id}: {e}")
@@ -1687,6 +2185,16 @@ class LayerHandle:
             )
             
             self._bbox_hitbox_handle.on_click(self._on_batched_click)
+
+
+            self._bbox_hitbox_handle.on_click(self._on_batched_click)
+
+
+    def _on_filter_update(self):
+        """Called when ObjectManager filter changes."""
+        # Only relevant if we are drawing bboxes
+        if self._draw_bboxes.value:
+            self._update_bboxes(self._G, self._layer)
 
 
     def _on_batched_click(self, event):
@@ -1761,6 +2269,10 @@ class LayerHandle:
 
         self._label_handles = []
         
+        if self._label_pool:
+            self._label_pool.remove()
+            self._label_pool = None
+        
         for label in self._bbox_label_handles:
             label.remove()
         
@@ -1797,7 +2309,7 @@ class GraphHandle:
         for layer in itertools.chain(G.layers, G.layer_partitions):
             color_modes[layer.key] = DEFAULT_COLORMODES.get(layer.key, ColorMode.LAYER)
 
-        colormaps = colormap_from_modes(color_modes)
+        colormaps = colormap_from_modes(G, color_modes)
 
         view = FlatGraphView(G)
         for layer in itertools.chain(G.layers, G.layer_partitions):
@@ -1809,9 +2321,9 @@ class GraphHandle:
                 G,
                 layer,
                 view,
-                self._update,
+                self._update,  # Parent Callback
+                object_manager=object_manager
             )
-            self._handles[layer.key].set_object_manager(object_manager)
 
 
         for source_layer, targets in view.edges.items():
@@ -1979,6 +2491,7 @@ class ViserRenderer:
         self._clear_graph()
         self._object_manager = ObjectManager(self._server, G, self._image_root, self._image_folder_prefix)
         self._graph_handle = GraphHandle(self._server, G, height_scale=height_scale, object_manager=self._object_manager)
+        self._stats_handle = GraphStatistics(self._server, G)
 
         if G.has_mesh():
             self.draw_mesh(G.mesh)
@@ -1991,6 +2504,9 @@ class ViserRenderer:
         """Remove all graph and mesh elements from the visualizer."""
         self._clear_mesh()
         self._clear_graph()
+        if hasattr(self, "_stats_handle") and self._stats_handle:
+            self._stats_handle.remove()
+            self._stats_handle = None
 
     def _clear_mesh(self):
         if self._mesh_handle:
@@ -2001,6 +2517,9 @@ class ViserRenderer:
         if self._graph_handle:
             self._graph_handle.remove()
             self._graph_handle = None
+        if hasattr(self, "_stats_handle") and self._stats_handle:
+            self._stats_handle.remove()
+            self._stats_handle = None
 
     def update(self, G):
         """Update the visualization from a modified scene graph."""
@@ -2014,6 +2533,10 @@ class ViserRenderer:
         if self._object_manager:
             self._object_manager._G = G
             self._object_manager.refresh()
+            
+        if hasattr(self, "_stats_handle") and self._stats_handle:
+            self._stats_handle._G = G
+            self._stats_handle.update()
             
         if G.has_mesh() and not self._mesh_handle:
              self.draw_mesh(G.mesh)
