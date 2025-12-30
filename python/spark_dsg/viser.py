@@ -336,6 +336,17 @@ class ObjectManager:
 
         self._object_dropdown.options = options
 
+
+    def refresh(self):
+        """Update dropdown options after graph modification."""
+        self._update_dropdown()
+        # Potentially verify if current selection still exists
+        if self._current_node:
+             if not self._G.has_node(self._current_node.id):
+                 self._current_node = None
+                 self._clear_visuals()
+                 self._object_dropdown.value = "None"
+
     def handle_click(self, node):
         # Find label for node
         target_val = node.id.value
@@ -1372,6 +1383,7 @@ class LayerHandle:
         self._object_manager = None # Will be set if passed
         self._G = G  # Store graph reference for labelspace access
         self._layer = layer  # Store layer reference
+        self._colormap = colormap
 
 
         self._folder = server.gui.add_folder(self.name, expand_by_default=False)
@@ -1418,35 +1430,8 @@ class LayerHandle:
 
         self._label_info = []
         self._label_handles = []
-        pos = view.pos(layer.key, height)
-        if pos is None:
-            return
-
-        colors = np.zeros(pos.shape)
-        for idx, node in enumerate(layer.nodes):
-            colors[idx] = colormap(G, node).to_float_array()
-
-        self._nodes = server.scene.add_point_cloud(
-            f"{self.name}_nodes", pos, colors=colors
-        )
-
-        labelspace = G.get_labelspace(self.key.layer, self.key.partition)
-        for idx, node in enumerate(layer.nodes):
-            text = node.id.str(literal=False)
-            if labelspace:
-                text += ": " + labelspace.get_node_category(node)
-
-            self._label_info.append(
-                LabelInfo(name=f"label_{node.id.str()}", text=text, pos=pos[idx])
-            )
-
-        edge_indices = view.layer_edges(layer.key)
-        if edge_indices is not None:
-            self._edges = server.scene.add_line_segments(
-                f"{self.name}_edges",
-                pos[edge_indices],
-                (0.0, 0.0, 0.0),
-            )
+        
+        self._regenerate_geometry(view, height)
 
         if self._draw_bboxes.value:
             self._update_bboxes(G, layer)
@@ -1483,6 +1468,56 @@ class LayerHandle:
         self._edge_scale.on_update(lambda _: self._update())
         self._draw_bboxes.on_update(lambda _: self._update())
         self._draw_bbox_labels.on_update(lambda _: self._update())
+
+    def refresh(self, view, height):
+        self._regenerate_geometry(view, height)
+        if self._draw_bboxes.value:
+            self._update_bboxes(self._G, self._layer)
+        self._update()
+
+    def _regenerate_geometry(self, view, height):
+        # Cleanup
+        if self._nodes:
+            self._nodes.remove()
+        if self._edges:
+            self._edges.remove()
+        for x in self._label_handles:
+            x.remove()
+        self._label_handles = []
+        self._label_info = []
+
+        pos = view.pos(self.key, height)
+        if pos is None:
+            self._nodes = None
+            self._edges = None
+            return
+
+        colors = np.zeros(pos.shape)
+        for idx, node in enumerate(self._layer.nodes):
+            colors[idx] = self._colormap(self._G, node).to_float_array()
+
+        self._nodes = self._server.scene.add_point_cloud(
+            f"{self.name}_nodes", pos, colors=colors
+        )
+
+        labelspace = self._G.get_labelspace(self.key.layer, self.key.partition)
+        for idx, node in enumerate(self._layer.nodes):
+            text = node.id.str(literal=False)
+            if labelspace:
+                text += ": " + labelspace.get_node_category(node)
+
+            self._label_info.append(
+                LabelInfo(name=f"label_{node.id.str()}", text=text, pos=pos[idx])
+            )
+
+        edge_indices = view.layer_edges(self.key)
+        if edge_indices is not None:
+            self._edges = self._server.scene.add_line_segments(
+                f"{self.name}_edges",
+                pos[edge_indices],
+                (0.0, 0.0, 0.0),
+            )
+
 
     def set_object_manager(self, manager):
         self._object_manager = manager
@@ -1750,6 +1785,8 @@ class GraphHandle:
         """Draw a scene graph in the visualizer."""
         self._handles = {}
         self._edge_handles = {}
+        self._G = G
+        self._server = server
         self._height_scale = height_scale
         self._object_manager = object_manager
         self._edge_scale = server.gui.add_number(
@@ -1801,6 +1838,62 @@ class GraphHandle:
 
         self._update()
         self._edge_scale.on_update(lambda _: self._update())
+
+    def refresh(self):
+        """Refresh graph geometry from the current graph state."""
+        view = FlatGraphView(self._G._G if hasattr(self._G, "_G") else self._G) # Handle wrapper if any
+        # Wait, self._handles stores LayerHandle.
+        # But we need G. G is stored in self._handles[key]._G? No, passed to init.
+        # We need to recreate FlatGraphView from the SAME G instance (which should have been modified in place).
+        # Actually in __init__, we did view = FlatGraphView(G).
+        # We need to store G in GraphHandle or assume implicit? 
+        # We passed G to __init__. Let's store it. Note: Python objects are references.
+        # Wait, I didn't store G in GraphHandle.__init__.
+        # I need to modify __init__ to store G.
+        
+        # ... Wait, I can't modify __init__ easily without replacing it.
+        # But LayerHandle has self._G.
+        # Let's assume self._handles values have access to G.
+        pass
+
+    def _refresh_internal(self, G):
+        # Helper called if we have G
+        view = FlatGraphView(G)
+        for key, handle in self._handles.items():
+            handle.refresh(view, self._layer_height(key))
+            
+        # Refresh edges
+        # Clear old edges
+        for _, handles in self._edge_handles.items():
+            for _, h in handles.items():
+                h.remove()
+        self._edge_handles = {}
+        
+        # Recreate edges
+        for source_layer, targets in view.edges.items():
+            self._edge_handles[source_layer] = {}
+            for target_layer, edge_indices in targets.items():
+                source_pos = view.pos(source_layer, self._layer_height(source_layer))
+                target_pos = view.pos(target_layer, self._layer_height(target_layer))
+                
+                if source_pos is None or target_pos is None: continue
+
+                source_name = _layer_name(source_layer)
+                target_name = _layer_name(target_layer)
+                pos = np.vstack((source_pos, target_pos))
+
+                edge_indices = edge_indices.copy()
+                edge_indices[:, 1] += source_pos.shape[0]
+
+                self._edge_handles[source_layer][target_layer] = (
+                    self._server.scene.add_line_segments(
+                        f"{source_name}_to_{target_name}",
+                        pos[edge_indices],
+                        (0.0, 0.0, 0.0),
+                    )
+                )
+        self._update()
+
 
     def remove(self):
         """Remove graph elements from the visualizer."""
@@ -1908,3 +2001,20 @@ class ViserRenderer:
         if self._graph_handle:
             self._graph_handle.remove()
             self._graph_handle = None
+
+    def update(self, G):
+        """Update the visualization from a modified scene graph."""
+        if self._graph_handle:
+            # We assume G is the SAME object as before, just modified.
+            # If G is a new object, we might need to update references in handles.
+            # But GraphHandle stored G.
+            self._graph_handle._G = G 
+            self._graph_handle._refresh_internal(G)
+            
+        if self._object_manager:
+            self._object_manager._G = G
+            self._object_manager.refresh()
+            
+        if G.has_mesh() and not self._mesh_handle:
+             self.draw_mesh(G.mesh)
+

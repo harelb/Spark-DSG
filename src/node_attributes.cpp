@@ -509,6 +509,18 @@ std::ostream& KhronosObjectAttributes::fill_ostream(std::ostream& out) const {
   out << "\n  - mesh: " << mesh.numVertices() << " vertices, " << mesh.numFaces()
       << " faces";
   out << "\n  - image_folder: " << image_folder;
+  if (!details.empty()) {
+    out << "\n  - details: {";
+    auto iter = details.begin();
+    while (iter != details.end()) {
+      out << iter->first << ": " << showIterable(iter->second);
+      ++iter;
+      if (iter != details.end()) {
+        out << ", ";
+      }
+    }
+    out << "}";
+  }
   return out;
 }
 
