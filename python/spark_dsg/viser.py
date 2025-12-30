@@ -2187,9 +2187,6 @@ class LayerHandle:
             self._bbox_hitbox_handle.on_click(self._on_batched_click)
 
 
-            self._bbox_hitbox_handle.on_click(self._on_batched_click)
-
-
     def _on_filter_update(self):
         """Called when ObjectManager filter changes."""
         # Only relevant if we are drawing bboxes
