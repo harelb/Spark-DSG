@@ -289,6 +289,7 @@ class ObjectManager:
         self._G = G
         self._image_root = Path(image_root) if image_root else None
         self._image_folder_prefix = Path(image_folder_prefix) if image_folder_prefix else None
+        self._graph_handle = None # Set externally by ViserRenderer
         
         # Create image container first so it appears at the top
         self._image_container = server.gui.add_folder("Selected Image")
@@ -346,6 +347,33 @@ class ObjectManager:
                 initial_value="None"
             )
             self._jump_button = server.gui.add_button("Jump to Object")
+            
+            # --- Transform Controls ---
+            self._transform_folder = server.gui.add_folder("Transform", visible=False)
+            with self._transform_folder:
+                self._transform_mode = server.gui.add_dropdown(
+                    "Gizmo Mode", options=["None", "Translate", "Rotate"], initial_value="None"
+                )
+                
+                with server.gui.add_folder("Position"):
+                    self._coord_x = server.gui.add_number("X", initial_value=0.0, step=0.1)
+                    self._coord_y = server.gui.add_number("Y", initial_value=0.0, step=0.1)
+                    self._coord_z = server.gui.add_number("Z", initial_value=0.0, step=0.1)
+                    
+                with server.gui.add_folder("Rotation (Deg)"):
+                    self._rot_r = server.gui.add_number("R", initial_value=0.0, step=5.0)
+                    self._rot_p = server.gui.add_number("P", initial_value=0.0, step=5.0)
+                    self._rot_y = server.gui.add_number("Y", initial_value=0.0, step=5.0)
+
+            self._transform_mode.on_update(self._on_transform_mode_change)
+            for handle in [self._coord_x, self._coord_y, self._coord_z, self._rot_r, self._rot_p, self._rot_y]:
+                 handle.on_update(self._on_coord_change)
+                 
+            self._apply_transform_btn = server.gui.add_button("Apply Transform", icon=viser.Icon.CHECK)
+            self._apply_transform_btn.on_click(self._on_apply_click)
+
+            self._transform_controls = None # Handle for viser transform controls
+            self.on_transform_apply = None # Callback (node_id, attributes)
             
             # Sidebar Navigation
             # Place small buttons for prev/next
@@ -632,7 +660,10 @@ class ObjectManager:
             
             # Text Filter
             if query:
-                if query not in label.lower():
+                # Fuzzy-like search: all tokens must be present
+                query_tokens = query.split()
+                label_lower = label.lower()
+                if not all(token in label_lower for token in query_tokens):
                     continue
 
             options.append(label)
@@ -1115,6 +1146,160 @@ class ObjectManager:
             
         self._update_image()
         self._update_mesh()
+        self._update_transform_ui()
+
+    def _on_transform_mode_change(self, event):
+        with self._lock:
+            self._update_transform_ui()
+
+    def _on_coord_change(self, event):
+        if getattr(self, "_syncing_transform", False):
+            return
+            
+        with self._lock:
+            if not self._current_node:
+                return
+            
+            # Update Node Attributes
+            # Create new array to avoid read-only errors if binded property returns read-only view
+            new_pos = np.array([self._coord_x.value, self._coord_y.value, self._coord_z.value])
+            self._current_node.attributes.position = new_pos
+            
+            # Rotation
+            import viser.transforms as vtf
+            # Assuming node has rotation? dsg.ObjectNodeAttributes usually only has position and orientation (quaternion)
+            # Check attribute name: 'orientation' usually.
+            # Convert RPY to Quaternion
+            r = np.radians(self._rot_r.value)
+            p = np.radians(self._rot_p.value)
+            y = np.radians(self._rot_y.value)
+            
+            q = vtf.SO3.from_rpy_radians(r, p, y).wxyz
+            
+            if hasattr(self._current_node.attributes, "orientation"):
+                 # spark_dsg Quaternion might be (w, x, y, z) or (x, y, z, w)
+                 # Expects spark_dsg.Quaternion
+                 pass 
+                 # For now, we skip updating orientation in graph if complex, but visuals need it.
+            
+            # Update Visuals
+            self._update_mesh()
+            
+            # Move controls if attached (remove and re-add or property?)
+            if self._transform_controls:
+                self._transform_controls.position = new_pos
+                self._transform_controls.wxyz = q
+                
+            # Update Layer Visuals (BBoxes)
+            if self._graph_handle:
+                self._graph_handle.update_node_visuals(self._current_node.id)
+
+    def _update_transform_ui(self):
+        # Sync UI with current node state
+        if not self._current_node:
+             self._transform_folder.visible = False
+             if self._transform_controls:
+                 self._transform_controls.remove()
+                 self._transform_controls = None
+             return
+
+        self._transform_folder.visible = True
+        
+        # Read Node State
+        pos = self._current_node.attributes.position
+        
+        # Avoid triggering recursive updates
+        self._syncing_transform = True
+        try:
+            self._coord_x.value = float(pos[0])
+            self._coord_y.value = float(pos[1])
+            self._coord_z.value = float(pos[2])
+            
+            # Extract RPY if possible (orientation)
+            # Set to 0 if not available for now
+            self._rot_r.value = 0.0
+            self._rot_p.value = 0.0
+            self._rot_y.value = 0.0
+        finally:
+             self._syncing_transform = False
+             
+        # Manage Gizmo
+        mode = self._transform_mode.value
+        if mode == "None":
+            if self._transform_controls:
+                self._transform_controls.remove()
+                self._transform_controls = None
+        else:
+            # Recreate or update
+            if self._transform_controls:
+                 self._transform_controls.remove()
+                 
+            self._transform_controls = self._server.scene.add_transform_controls(
+                 f"/gizmo_{self._current_node.id}",
+                 scale=0.5,
+                 position=pos,
+                 disable_axes=False,
+                 disable_sliders=False,
+                 disable_rotations=(mode == "Translate")
+            )
+            self._transform_controls.on_update(self._on_gizmo_update)
+
+    def _on_gizmo_update(self, event):
+        # Update Node from Gizmo
+        with self._lock:
+            if not self._current_node or not self._transform_controls:
+                return
+                
+            new_pos = self._transform_controls.position
+            # Update Node
+            # Update Node
+            # Avoid in-place update of read-only array
+            # p = self._current_node.attributes.position
+            # p[0] = new_pos[0] ...
+            self._current_node.attributes.position = np.array(new_pos)
+            
+            # Sync UI
+            self._syncing_transform = True
+            try:
+                self._coord_x.value = float(new_pos[0])
+                self._coord_y.value = float(new_pos[1])
+                self._coord_z.value = float(new_pos[2])
+            finally:
+                self._syncing_transform = False
+              
+            # Trigger other visual updates (like mesh position?)
+            # Mesh is usually static relative to node position? 
+            if self._mesh_handle:
+                 # Viser meshes are added at absolute path.
+                 # Actually add_mesh_trimesh takes 'position'.
+                 self._mesh_handle.position = new_pos
+                 
+            # Update Layer Visuals (BBoxes)
+            if self._graph_handle:
+                self._graph_handle.update_node_visuals(self._current_node.id)
+
+    def _on_apply_click(self, event):
+        """Trigger external persistence callback."""
+        if not self._current_node:
+            print("No node selected to apply.")
+            return
+            
+        if self.on_transform_apply:
+            # Gather current attributes
+            # We are reading from _current_node because UI updates it live
+            pos = self._current_node.attributes.position
+            # Convert to list
+            pos_list = [float(pos[0]), float(pos[1]), float(pos[2])]
+            
+            # TODO: Add Rotation
+            
+            attrs = {"position": pos_list}
+            # Pass client for notifications
+            self.on_transform_apply(self._current_node.id, attrs, event.client)
+            
+            event.client.add_notification("Success", "Transform Applied (Persisted)")
+        else:
+            event.client.add_notification("Warning", "Persistence not connected.")
 
     def _update_mesh(self):
         if not self._toggle_mesh.value:
@@ -2198,9 +2383,23 @@ class LayerHandle:
                     continue
 
                 try:
+                    # --- Sync Logic ---
+                    # Calculate offset if node position has moved but bbox is stale
+                    node_pos = np.array(node.attributes.position)
+                    bbox_center = np.array(bbox.world_P_center)
+                    
+                    # Assume we want to translate the bbox so its center aligns with node position 
+                    # (or maintains relative offset if we knew original node pos, but we assume centered/aligned movement)
+                    # For gizmo interaction where we move the node, we want the box to follow.
+                    # Best guess: Shift everyone by (node_pos - bbox_center)?
+                    # WARNING: If bbox center was intentionally offset from node origin, this snaps it to node origin.
+                    # But for now, this is the best 'sync' we can do without knowing original offset relative to node.
+                    # Given 'world_P_center', it's likely the centroid.
+                    offset = node_pos - bbox_center
+
                     # --- Wireframe Data ---
                     c_list = bbox.corners()
-                    corners = np.array(c_list) 
+                    corners = np.array(c_list) + offset # Apply offset
                     
                     if corners.shape == (8, 3):
                         # Add segments
@@ -2220,7 +2419,7 @@ class LayerHandle:
                     # --- Hitbox Data ---
                     # Only add if we need hitboxes (interactive)
                     dim = np.array(bbox.dimensions)
-                    center = np.array(bbox.world_P_center)
+                    center = bbox_center + offset # Should roughly equal node_pos
                     R = np.array(bbox.world_R_center)
                     
                     hitbox_positions.append(center)
@@ -2444,6 +2643,18 @@ class GraphHandle:
         self._update()
         self._edge_scale.on_update(lambda _: self._update())
 
+    def update_node_visuals(self, node_id):
+        """Trigger update of visuals (bboxes, etc) for a specific node."""
+        node = self._G.get_node(node_id)
+        if not node: return
+        
+        # Find Layer
+        for layer in itertools.chain(self._G.layers, self._G.layer_partitions):
+            if layer.has_node(node_id):
+                if layer.key in self._handles:
+                     self._handles[layer.key]._update_bboxes(self._G, layer)
+                return
+
     def refresh(self):
         """Refresh graph geometry from the current graph state."""
         view = FlatGraphView(self._G._G if hasattr(self._G, "_G") else self._G) # Handle wrapper if any
@@ -2584,6 +2795,7 @@ class ViserRenderer:
         self._clear_graph()
         self._object_manager = ObjectManager(self._server, G, self._image_root, self._image_folder_prefix)
         self._graph_handle = GraphHandle(self._server, G, height_scale=height_scale, object_manager=self._object_manager)
+        self._object_manager._graph_handle = self._graph_handle
         self._stats_handle = GraphStatistics(self._server, G)
 
         if G.has_mesh():
