@@ -430,6 +430,116 @@ class ObjectManager:
         if self._image_root:
             print(f"ObjectManager initialized with image_root: {self._image_root}")
 
+    def add_custom_button(self, name, icon=None, callback=None):
+        """Add a custom button to the Object Browser panel."""
+        with self._folder:
+            btn = self._server.gui.add_button(name, icon=icon)
+            if callback:
+                btn.on_click(callback)
+            return btn
+
+    def get_current_view(self):
+        """Captures the current view from the connected client."""
+        clients = self._server.get_clients()
+        if not clients:
+             return None
+        
+        # Pick first client
+        client = list(clients.values())[0]
+        try:
+             # Capture
+             rgb = client.get_render(height=720, width=1280)
+             # Convert to Base64
+             img = Image.fromarray(rgb)
+             buf = io.BytesIO()
+             img.save(buf, format="JPEG")
+             return base64.b64encode(buf.getvalue()).decode("utf-8")
+        except Exception as e:
+             print(f"Error getting render: {e}")
+             return None
+
+    def _jump_to_node_client(self, node, client):
+        """Helper to jump a specific client camera to a node."""
+        pos = node.attributes.position
+        
+        # If 3D image is shown, look at it
+        if self._show_3d_image.value and self._image_handle_3d is not None and self._current_node == node:
+            try:
+                target_pos = self._image_handle_3d.position
+                client.camera.look_at = target_pos
+                client.camera.position = target_pos + np.array([0.0, 6.0, 0.0])
+                return
+            except Exception:
+                pass
+        
+        # Fallback to oblique view
+        client.camera.look_at = pos
+        client.camera.position = pos + np.array([-5.0, -5.0, 5.0])
+
+    def _on_jump(self, event):
+        """Jump handler."""
+        if self._current_node and event.client:
+            self._jump_to_node_client(self._current_node, event.client)
+
+    def jump_to(self, node_id):
+        """Programmatic jump to object."""
+        target_node = None
+    
+        # Normalize input: "O(0)" -> "O0"
+        node_id_clean = str(node_id).upper().replace("(", "").replace(")", "").strip()
+        
+        # 1. Try finding by iteration (handling normalization)
+        for layer in self._G.layers:
+             for node in layer.nodes:
+                 nid_str = str(node.id)
+                 # Exact match
+                 if nid_str == str(node_id):
+                     target_node = node
+                     break
+                 
+                 # Normalized match
+                 nid_clean = nid_str.upper().replace("(", "").replace(")", "").strip()
+                 if nid_clean == node_id_clean:
+                     target_node = node
+                     break
+                     
+                 # Name match
+                 if hasattr(node.attributes, "name") and node.attributes.name:
+                     if str(node.attributes.name) == str(node_id):
+                         target_node = node
+                         break
+                         
+             if target_node: break
+        
+        if not target_node:
+             # 2. Try raw int if input is numeric
+             try:
+                nid = int(node_id)
+                for layer in self._G.layers:
+                    for node in layer.nodes:
+                        if node.id.value == nid:
+                            target_node = node
+                            break
+                    if target_node: break
+             except Exception:
+                pass
+        
+        if target_node:
+            self._current_node = target_node
+            # Update visuals
+            with self._lock:
+                self._update_selection()
+            
+            clients = self._server.get_clients()
+            if clients:
+                client = list(clients.values())[0]
+                self._jump_to_node_client(target_node, client)
+                return f"Jumped to object {node_id} (found as {target_node.id})"
+            return "Object selected (no client connected for camera jump)."
+            
+        return f"Node {node_id} not found."
+
+
     def _scan_classes(self):
         """Scan unique semantic labels in Object layer (Layer 2)."""
         classes = {} # Name -> Label ID (or just use string matching if only names available)
@@ -958,32 +1068,7 @@ class ObjectManager:
             self._current_node = self._G.get_node(node_id)
             self._update_selection()
 
-    def _on_jump(self, event):
-        if self._current_node and event.client:
-            pos = self._current_node.attributes.position
-            
-            # If 3D image is shown, look at it
-            if self._show_3d_image.value and self._image_handle_3d is not None:
-                # Get position from handle if possible
-                try:
-                    target_pos = self._image_handle_3d.position
-                    # Image is in XZ plane facing +Y (due to -90 X rotation)
-                    # So we want to look at it from +Y direction
-                    # target_pos is the center of the image
-                    
-                    event.client.camera.look_at = target_pos
-                    # Stand back in Y
-                    # Zoom out more (User request: "zoom out a more")
-                    # Previous: 3.0. New: 6.0
-                    event.client.camera.position = target_pos + np.array([0.0, 6.0, 0.0])
-                    return
-                except:
-                    pass
-            
-            # Fallback to oblique view
-            event.client.camera.look_at = pos
-            # Zoom out a bit
-            event.client.camera.position = pos + np.array([-5.0, -5.0, 5.0])
+
 
     def _on_view_update(self, event):
         with self._lock:
@@ -1907,14 +1992,14 @@ class LayerHandle:
             self._nodes.colors = colors
             
         # Update bounding boxes if visible
-        if self._draw_bboxes.value:
-            self._update_bboxes(self._G, self._layer)
+        # Update bounding boxes if visible
+        # Always update to ensure hitboxes exist
+        self._update_bboxes(self._G, self._layer)
 
 
-    def refresh(self, view, height):
         self._regenerate_geometry(view, height)
-        if self._draw_bboxes.value:
-            self._update_bboxes(self._G, self._layer)
+        # Always update bboxes to ensure hitboxes exist
+        self._update_bboxes(self._G, self._layer)
         self._update()
 
     def _regenerate_geometry(self, view, height):
@@ -2032,7 +2117,8 @@ class LayerHandle:
         if self._bbox_lines_handle:
              self._bbox_lines_handle.visible = draw_bboxes
         if self._bbox_hitbox_handle:
-             self._bbox_hitbox_handle.visible = draw_bboxes
+             # Always keep hitboxes active for interaction
+             self._bbox_hitbox_handle.visible = True
         
         # Toggle BBox Labels visibility
         if not draw_bbox_labels and bbox_labels_drawn:
@@ -2048,16 +2134,25 @@ class LayerHandle:
     def _update_bboxes(self, G, layer):
         # Clear existing
         if self._bbox_lines_handle:
-            self._bbox_lines_handle.remove()
+            try:
+                self._bbox_lines_handle.remove()
+            except Exception:
+                pass
             self._bbox_lines_handle = None
             
         if self._bbox_hitbox_handle:
-            self._bbox_hitbox_handle.remove()
+            try:
+                self._bbox_hitbox_handle.remove()
+            except Exception:
+                pass
             self._bbox_hitbox_handle = None
         
         # Clear bbox labels
         for label in self._bbox_label_handles:
-            label.remove()
+            try:
+                label.remove()
+            except Exception:
+                pass
         self._bbox_label_handles = []
             
         self._bbox_id_map = [] # Track which node each bbox corresponds to
@@ -2199,6 +2294,7 @@ class LayerHandle:
         idx = event.instance_index
         if idx is not None and 0 <= idx < len(self._bbox_id_map):
             node = self._bbox_id_map[idx]
+            print(f"Debug: Clicked node {node.id}")
             if self._object_manager:
                 self._object_manager.handle_click(node)
     
