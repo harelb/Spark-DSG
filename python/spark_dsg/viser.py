@@ -293,6 +293,37 @@ class ObjectManager:
         
         # Create image container first so it appears at the top
         self._image_container = server.gui.add_folder("Selected Image")
+        
+        # Image display handles (set later when image is loaded)
+        self._image_handle_2d = None
+        self._image_handle_3d = None
+        self._image_label_3d = None
+        self._mesh_handle = None
+
+        # --- Image Controls (placed in image container for visibility) ---
+        with self._image_container:
+            # Navigation buttons - directly under image
+            self._side_prev_btn = server.gui.add_button("◀ Prev", icon=viser.Icon.ARROW_LEFT)
+            self._side_next_btn = server.gui.add_button("Next ▶", icon=viser.Icon.ARROW_RIGHT)
+            
+            # Frame slider - visible when multiple images
+            self._image_slider = server.gui.add_slider(
+                "Frame", min=0, max=1, step=1, initial_value=0, visible=False
+            )
+            
+            # Playback controls - inline (no folder wrapper)
+            self._play_button = server.gui.add_button("Play", icon=viser.Icon.PLAYER_PLAY, visible=False)
+            self._pause_button = server.gui.add_button("Pause", icon=viser.Icon.PLAYER_PAUSE, visible=False)
+            self._fps_number = server.gui.add_number("FPS", initial_value=10.0, min=1.0, max=60.0, visible=False)
+            self._save_gif_btn = server.gui.add_button("Save GIF", icon=viser.Icon.FILE_DOWNLOAD, visible=False)
+            self._maximize_btn = server.gui.add_button("Fullscreen", icon=viser.Icon.ZOOM_IN, visible=False)
+        
+        # Connect navigation callbacks
+        self._side_prev_btn.on_click(lambda _: self._step_object(-1))
+        self._side_next_btn.on_click(lambda _: self._step_object(1))
+        
+        # Legacy folder reference for playback visibility toggling
+        self._playback_folder = None  # No longer using folder, controls are inline
 
         # Hacks for wider modals
         # Viser uses Mantine UI. Inject global styles via HTML so <style> is respected.
@@ -348,42 +379,7 @@ class ObjectManager:
             )
             self._jump_button = server.gui.add_button("Jump to Object")
             
-            # --- Transform Controls ---
-            self._transform_folder = server.gui.add_folder("Transform", visible=False)
-            with self._transform_folder:
-                self._transform_mode = server.gui.add_dropdown(
-                    "Gizmo Mode", options=["None", "Translate", "Rotate"], initial_value="None"
-                )
-                
-                with server.gui.add_folder("Position"):
-                    self._coord_x = server.gui.add_number("X", initial_value=0.0, step=0.1)
-                    self._coord_y = server.gui.add_number("Y", initial_value=0.0, step=0.1)
-                    self._coord_z = server.gui.add_number("Z", initial_value=0.0, step=0.1)
-                    
-                with server.gui.add_folder("Rotation (Deg)"):
-                    self._rot_r = server.gui.add_number("R", initial_value=0.0, step=5.0)
-                    self._rot_p = server.gui.add_number("P", initial_value=0.0, step=5.0)
-                    self._rot_y = server.gui.add_number("Y", initial_value=0.0, step=5.0)
-
-            self._transform_mode.on_update(self._on_transform_mode_change)
-            for handle in [self._coord_x, self._coord_y, self._coord_z, self._rot_r, self._rot_p, self._rot_y]:
-                 handle.on_update(self._on_coord_change)
-                 
-            self._apply_transform_btn = server.gui.add_button("Apply Transform", icon=viser.Icon.CHECK)
-            self._apply_transform_btn.on_click(self._on_apply_click)
-
-            self._transform_controls = None # Handle for viser transform controls
-            self.on_transform_apply = None # Callback (node_id, attributes)
-            
-            # Sidebar Navigation
-            # Place small buttons for prev/next
-            with server.gui.add_folder("Navigation", visible=True) as nav_folder:
-                 self._side_prev_btn = server.gui.add_button("Prev", icon=viser.Icon.ARROW_LEFT)
-                 self._side_next_btn = server.gui.add_button("Next", icon=viser.Icon.ARROW_RIGHT)
-                 
-            self._side_prev_btn.on_click(lambda _: self._step_object(-1))
-            self._side_next_btn.on_click(lambda _: self._step_object(1))
-            
+            # View options
             self._toggle_mesh = server.gui.add_checkbox("Show Object Mesh", initial_value=True)
             self._toggle_bbox_2d = server.gui.add_checkbox("Show 2D BBox", initial_value=True)
             self._show_mask = server.gui.add_checkbox("Show Mask", initial_value=False)
@@ -391,23 +387,32 @@ class ObjectManager:
             self._show_3d_image = server.gui.add_checkbox("Show 3D Image", initial_value=True)
             self._maximize_2d = server.gui.add_checkbox("Maximize 2D Image", initial_value=False)
             
-            self._image_handle_2d = None
-            self._image_handle_3d = None
-            self._image_label_3d = None
-            self._mesh_handle = None
-            
-            # Gallery Controls
-            self._image_slider = server.gui.add_slider(
-                "Frame Index", min=0, max=1, step=1, initial_value=0, visible=False
+        # --- Transform Controls (collapsed by default) ---
+        self._transform_folder = server.gui.add_folder("Transform", visible=False)
+        with self._transform_folder:
+            self._transform_mode = server.gui.add_dropdown(
+                "Gizmo Mode", options=["None", "Translate", "Rotate"], initial_value="None"
             )
-            self._maximize_btn = server.gui.add_button("Fullscreen Image", icon=viser.Icon.ZOOM_IN, visible=False)
             
-            # Playback Controls placed in a row
-            with server.gui.add_folder("Playback Controls", visible=False) as self._playback_folder:
-                 self._play_button = server.gui.add_button("Play", icon=viser.Icon.PLAYER_PLAY)
-                 self._pause_button = server.gui.add_button("Pause", icon=viser.Icon.PLAYER_PAUSE, visible=False)
-                 self._fps_number = server.gui.add_number("FPS", initial_value=10.0, min=1.0, max=60.0)
-                 self._save_gif_btn = server.gui.add_button("Save as GIF", icon=viser.Icon.FILE_DOWNLOAD)
+            with server.gui.add_folder("Position"):
+                self._coord_x = server.gui.add_number("X", initial_value=0.0, step=0.1)
+                self._coord_y = server.gui.add_number("Y", initial_value=0.0, step=0.1)
+                self._coord_z = server.gui.add_number("Z", initial_value=0.0, step=0.1)
+                
+            with server.gui.add_folder("Rotation (Deg)"):
+                self._rot_r = server.gui.add_number("R", initial_value=0.0, step=5.0)
+                self._rot_p = server.gui.add_number("P", initial_value=0.0, step=5.0)
+                self._rot_y = server.gui.add_number("Y", initial_value=0.0, step=5.0)
+
+            self._apply_transform_btn = server.gui.add_button("Apply Transform", icon=viser.Icon.CHECK)
+
+        self._transform_mode.on_update(self._on_transform_mode_change)
+        for handle in [self._coord_x, self._coord_y, self._coord_z, self._rot_r, self._rot_p, self._rot_y]:
+             handle.on_update(self._on_coord_change)
+        self._apply_transform_btn.on_click(self._on_apply_click)
+
+        self._transform_controls = None # Handle for viser transform controls
+        self.on_transform_apply = None # Callback (node_id, attributes)
 
         self._current_node = None
         self._node_map = {} # label -> node_id
@@ -1088,7 +1093,11 @@ class ObjectManager:
                 self._clear_visuals()
                 self._playing = False
                 self._image_slider.visible = False
-                self._playback_folder.visible = False
+                # Hide playback controls (no longer in folder)
+                self._play_button.visible = False
+                self._pause_button.visible = False
+                self._fps_number.visible = False
+                self._save_gif_btn.visible = False
                 self._maximize_btn.visible = False
                 return
 
@@ -1131,10 +1140,18 @@ class ObjectManager:
         if len(self._current_images) > 1:
             self._image_slider.max = len(self._current_images) - 1
             self._image_slider.visible = True
-            self._playback_folder.visible = True
+            # Show playback controls inline
+            self._play_button.visible = not self._playing
+            self._pause_button.visible = self._playing
+            self._fps_number.visible = True
+            self._save_gif_btn.visible = True
         else:
             self._image_slider.visible = False
-            self._playback_folder.visible = False
+            # Hide playback controls
+            self._play_button.visible = False
+            self._pause_button.visible = False
+            self._fps_number.visible = False
+            self._save_gif_btn.visible = False
             self._playing = False
             self._image_slider.value = 0
             
