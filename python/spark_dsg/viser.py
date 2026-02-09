@@ -18,6 +18,7 @@ import threading
 from pathlib import Path
 from PIL import Image, ImageDraw
 
+
 # Cache valid for mostly static images on disk
 @functools.lru_cache(maxsize=128)
 def load_and_process_image(path, max_dim=1024):
@@ -456,6 +457,9 @@ class ObjectManager:
         self._pause_button.on_click(self._on_pause)
         self._save_gif_btn.on_click(self._on_save_gif)
 
+        # Condition for playback loop to avoid polling
+        self._playback_condition = threading.Condition()
+
         # Start playback thread
         self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
         self._playback_thread.start()
@@ -717,15 +721,26 @@ class ObjectManager:
 
     def _playback_loop(self):
         while True:
-            # Snapshot state safely
-            should_play = False
-            image_count = 0
+            # Wait until playing is enabled
+            with self._playback_condition:
+                should_wait = False
+                with self._lock:
+                     if not self._playing:
+                         should_wait = True
+                
+                if should_wait:
+                    self._playback_condition.wait()
             
+            # Playing logic
+            image_count = 0
             with self._lock:
-                should_play = self._playing
+                # Check again in case stopped while waiting on lock? 
+                # (Logic above handles wait, but here we just need safe access)
+                if not self._playing:
+                    continue
                 image_count = len(self._current_images)
             
-            if should_play and image_count > 0:
+            if image_count > 0:
                 try:
                     # We need to update slider on main thread usually? 
                     # Viser handles are thread safe for updates generally, but logic needs sync
@@ -743,7 +758,8 @@ class ObjectManager:
                     with self._lock:
                         self._playing = False
             else:
-                time.sleep(0.1)
+                # Should not really happen if playing logic is correct, but safe fallback
+                time.sleep(1.0)
 
     def _on_slider_update(self, event):
         # Only update if image changed
@@ -753,7 +769,12 @@ class ObjectManager:
             self._update_image()
 
     def _on_play(self, event):
-        self._playing = True
+        with self._lock:
+            self._playing = True
+        
+        with self._playback_condition:
+            self._playback_condition.notify_all()
+
         self._play_button.visible = False
         self._pause_button.visible = True
         # Sync modal buttons if fullscreen is open.
@@ -1035,7 +1056,11 @@ class ObjectManager:
                     
                     # Modal-specific play/pause handlers that manage modal button visibility
                     def _modal_play(_):
-                        self._playing = True
+                        with self._lock:
+                            self._playing = True
+                        with self._playback_condition:
+                            self._playback_condition.notify_all()
+                            
                         play_btn.visible = False
                         pause_btn.visible = True
 
@@ -1868,6 +1893,21 @@ class LabelPool:
         self._layer_name = layer_name
         self._lock = threading.Lock()
         
+        # Event for updates
+        self._camera_update_event = threading.Event()
+        
+        # Register camera update callback
+        # We need to hook into server client connections
+        @self._server.on_client_connect
+        def _(client):
+            client.camera.on_update(lambda _: self._camera_update_event.set())
+            # Force one update on connection
+            self._camera_update_event.set()
+        
+        # Determine initial visibility - if we can
+        # Maybe set initial handles for testing?
+        # Hidden by default until loop shows them.
+        
         # Create pool of handles (initially hidden)
         with self._server.atomic():
             for i in range(max_labels):
@@ -1892,6 +1932,7 @@ class LabelPool:
         
     def stop(self):
         self._running = False
+        self._camera_update_event.set() # Wake up thread
         if self._thread:
             self._thread.join(timeout=1.0)
             self._thread = None
@@ -1905,9 +1946,21 @@ class LabelPool:
     def _update_loop(self):
         while self._running:
             try:
+                # Wait for camera update
+                if not self._camera_update_event.wait(timeout=2.0):
+                    # Timeout just to check self._running occasionally
+                    continue
+                
+                self._camera_update_event.clear()
+                
+                # Debounce/Rate Limit: Sleep/Wait a bit after trigger
+                time.sleep(0.5) 
+                
+                if not self._running:
+                    break
+
                 clients = self._server.get_clients()
                 if not clients:
-                    time.sleep(0.5)
                     continue
                 
                 # Use the first client's camera
@@ -1922,7 +1975,6 @@ class LabelPool:
                     # Hide all
                     for h in self._handles:
                         h.visible = False
-                    time.sleep(0.5)
                     continue
                     
                 # Sort by distance
@@ -1958,8 +2010,6 @@ class LabelPool:
                     for i in range(k, self._max_labels):
                         self._handles[i].visible = False
                         
-                time.sleep(0.1) # 10Hz update
-                
             except Exception as e:
                 # print(f"Label pool error: {e}")
                 time.sleep(1.0)
