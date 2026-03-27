@@ -499,6 +499,7 @@ std::ostream& AgentNodeAttributes::fill_ostream(std::ostream& out) const {
   NodeAttributes::fill_ostream(out);
   out << "\n  - orientation: " << quatToString(world_R_body);
   out << "\n  - observed_semantic_labels.size(): " << observed_semantic_labels.size();
+  out << "\n  - image_folder: " << image_folder;
   return out;
 }
 
@@ -517,6 +518,7 @@ void AgentNodeAttributes::serialization_info() {
   serialization::field("dbow_ids", dbow_ids);
   serialization::field("dbow_values", dbow_values);
   serialization::field("observed_semantic_labels", observed_semantic_labels);
+  serialization::field("image_folder", image_folder);
 }
 
 bool AgentNodeAttributes::is_equal(const NodeAttributes& other) const {
@@ -533,7 +535,8 @@ bool AgentNodeAttributes::is_equal(const NodeAttributes& other) const {
          quaternionsEqual(world_R_body, derived->world_R_body) &&
          external_key == derived->external_key && dbow_ids == derived->dbow_ids &&
          dbow_values == derived->dbow_values &&
-         observed_semantic_labels == derived->observed_semantic_labels;
+         observed_semantic_labels == derived->observed_semantic_labels &&
+         image_folder == derived->image_folder;
 }
 
 KhronosObjectAttributes::KhronosObjectAttributes() : mesh(true, false, false) {}

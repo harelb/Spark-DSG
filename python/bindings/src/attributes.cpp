@@ -227,7 +227,8 @@ void init_attributes(py::module_& m) {
       .def_readwrite("external_key", &AgentNodeAttributes::external_key)
       .def_readwrite("dbow_ids", &AgentNodeAttributes::dbow_ids)
       .def_readwrite("dbow_values", &AgentNodeAttributes::dbow_values)
-      .def_readwrite("observed_semantic_labels", &AgentNodeAttributes::observed_semantic_labels);
+      .def_readwrite("observed_semantic_labels", &AgentNodeAttributes::observed_semantic_labels)
+      .def_readwrite("image_folder", &AgentNodeAttributes::image_folder);
 
   py::class_<EdgeAttributes>(m, "EdgeAttributes")
       .def(py::init<>())
