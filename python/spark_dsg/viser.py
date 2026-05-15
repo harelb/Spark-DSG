@@ -2117,6 +2117,14 @@ class LayerHandle:
             
             self._color_mode_dropdown.on_update(self._on_colormode_change)
 
+            self._draw_nodes.on_update(lambda _: self._update())
+            self._draw_edges.on_update(lambda _: self._update())
+            self._draw_labels.on_update(lambda _: self._update())
+            self._draw_bboxes.on_update(lambda _: self._update())
+            self._draw_bbox_labels.on_update(lambda _: self._update())
+            self._node_scale.on_update(lambda _: self._update())
+            self._edge_scale.on_update(lambda _: self._update())
+
         # Special: Path drawing for Agents
         self._draw_path = None
         self._path_handle = None
