@@ -1856,11 +1856,10 @@ class LayerConfig:
 DEFAULT_CONFIG = {
     dsg.LayerKey(2): LayerConfig(node_scale=0.25, draw_labels=True),
     dsg.LayerKey(3): LayerConfig(node_scale=0.1),
-    dsg.LayerKey(3, 1): LayerConfig(node_scale=0.1),
+    dsg.LayerKey(3, 1): LayerConfig(node_scale=0.1, draw_nodes=False, draw_edges=False),
     dsg.LayerKey(3, 2): LayerConfig(node_scale=0.1),
     dsg.LayerKey(4): LayerConfig(node_scale=0.4, draw_labels=True, draw_bboxes=True),
     dsg.LayerKey(5): LayerConfig(draw_nodes=False),
-    dsg.LayerKey(20): LayerConfig(draw_nodes=False, draw_edges=False),
 }
 
 DEFAULT_COLORMODES = {
