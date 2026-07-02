@@ -383,6 +383,38 @@ struct AgentNodeAttributes : public NodeAttributes {
 };
 
 /**
+ * @brief Non-optimized image sub-keyframe anchored to an agent keyframe.
+ *
+ * Stores the relative transform anchor_T_subframe (durable source of truth).
+ * World pose (this->position + orientation) is derived from the optimized
+ * anchor in the backend (see UpdateSubKeyframeFunctor).
+ */
+struct SubKeyframeNodeAttributes : public NodeAttributes {
+ public:
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  using Ptr = std::unique_ptr<SubKeyframeNodeAttributes>;
+
+  SubKeyframeNodeAttributes();
+  virtual ~SubKeyframeNodeAttributes() = default;
+
+  NodeAttributes::Ptr clone() const override;
+  void transform(const Eigen::Isometry3d& transform) override;
+
+  NodeId anchor_node_id = 0;
+  Eigen::Vector3d anchor_t_subframe = Eigen::Vector3d::Zero();
+  Eigen::Quaterniond anchor_R_subframe = Eigen::Quaterniond::Identity();
+  std::string image_folder;
+  std::chrono::nanoseconds timestamp{0};
+
+ protected:
+  std::ostream& fill_ostream(std::ostream& out) const override;
+  void serialization_info() override;
+  bool is_equal(const NodeAttributes& other) const override;
+  // registers derived attributes
+  REGISTER_NODE_ATTRIBUTES(SubKeyframeNodeAttributes);
+};
+
+/**
  * @brief Attributes for khronos object nodes.
  */
 struct KhronosObjectAttributes : public ObjectNodeAttributes {
