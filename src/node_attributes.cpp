@@ -34,6 +34,7 @@
  * -------------------------------------------------------------------------- */
 #include "spark_dsg/node_attributes.h"
 
+#include "spark_dsg/node_symbol.h"
 #include "spark_dsg/printing.h"
 #include "spark_dsg/serialization/attribute_serialization.h"
 #include "spark_dsg/serialization/binary_conversions.h"
@@ -499,6 +500,7 @@ std::ostream& AgentNodeAttributes::fill_ostream(std::ostream& out) const {
   NodeAttributes::fill_ostream(out);
   out << "\n  - orientation: " << quatToString(world_R_body);
   out << "\n  - observed_semantic_labels.size(): " << observed_semantic_labels.size();
+  out << "\n  - image_folder: " << image_folder;
   return out;
 }
 
@@ -517,6 +519,7 @@ void AgentNodeAttributes::serialization_info() {
   serialization::field("dbow_ids", dbow_ids);
   serialization::field("dbow_values", dbow_values);
   serialization::field("observed_semantic_labels", observed_semantic_labels);
+  serialization::field("image_folder", image_folder);
 }
 
 bool AgentNodeAttributes::is_equal(const NodeAttributes& other) const {
@@ -533,7 +536,53 @@ bool AgentNodeAttributes::is_equal(const NodeAttributes& other) const {
          quaternionsEqual(world_R_body, derived->world_R_body) &&
          external_key == derived->external_key && dbow_ids == derived->dbow_ids &&
          dbow_values == derived->dbow_values &&
-         observed_semantic_labels == derived->observed_semantic_labels;
+         observed_semantic_labels == derived->observed_semantic_labels &&
+         image_folder == derived->image_folder;
+}
+
+SubKeyframeNodeAttributes::SubKeyframeNodeAttributes() : NodeAttributes() {}
+
+NodeAttributes::Ptr SubKeyframeNodeAttributes::clone() const {
+  return std::make_unique<SubKeyframeNodeAttributes>(*this);
+}
+
+void SubKeyframeNodeAttributes::transform(const Eigen::Isometry3d& transform) {
+  // Only the (derived) world position transforms; anchor_T_subframe is relative
+  // to the anchor and is invariant under a global transform.
+  NodeAttributes::transform(transform);
+}
+
+std::ostream& SubKeyframeNodeAttributes::fill_ostream(std::ostream& out) const {
+  NodeAttributes::fill_ostream(out);
+  out << "\n  - anchor_node_id: " << NodeSymbol(anchor_node_id).str()
+      << "\n  - image_folder: " << image_folder
+      << "\n  - timestamp: " << timestamp.count();
+  return out;
+}
+
+void SubKeyframeNodeAttributes::serialization_info() {
+  NodeAttributes::serialization_info();
+  serialization::field("anchor_node_id", anchor_node_id);
+  serialization::field("anchor_t_subframe", anchor_t_subframe);
+  serialization::field("anchor_R_subframe", anchor_R_subframe);
+  serialization::field("image_folder", image_folder);
+  serialization::field("timestamp", timestamp);
+}
+
+bool SubKeyframeNodeAttributes::is_equal(const NodeAttributes& other) const {
+  const auto derived = dynamic_cast<const SubKeyframeNodeAttributes*>(&other);
+  if (!derived) {
+    return false;
+  }
+
+  if (!NodeAttributes::is_equal(other)) {
+    return false;
+  }
+
+  return anchor_node_id == derived->anchor_node_id &&
+         anchor_t_subframe.isApprox(derived->anchor_t_subframe) &&
+         quaternionsEqual(anchor_R_subframe, derived->anchor_R_subframe) &&
+         image_folder == derived->image_folder && timestamp == derived->timestamp;
 }
 
 KhronosObjectAttributes::KhronosObjectAttributes() : mesh(true, false, false) {}
@@ -554,6 +603,7 @@ std::ostream& KhronosObjectAttributes::fill_ostream(std::ostream& out) const {
   }
   out << "\n  - mesh: " << mesh.numVertices() << " vertices, " << mesh.numFaces()
       << " faces";
+  out << "\n  - image_folder: " << image_folder;
   return out;
 }
 
@@ -565,6 +615,7 @@ void KhronosObjectAttributes::serialization_info() {
   serialization::field("trajectory_timestamps", trajectory_timestamps);
   serialization::field("dynamic_object_points", dynamic_object_points);
   serialization::field("details", details);
+  serialization::field("image_folder", image_folder);
 
   const auto& header = io::GlobalInfo::loadedHeader();
   if (header.version <= io::Version(1, 0, 1)) {
@@ -616,7 +667,7 @@ bool KhronosObjectAttributes::is_equal(const NodeAttributes& other) const {
          last_observed_ns == derived->last_observed_ns && mesh == derived->mesh &&
          trajectory_positions == derived->trajectory_positions &&
          dynamic_object_points == derived->dynamic_object_points &&
-         details == derived->details;
+         details == derived->details && image_folder == derived->image_folder;
 }
 
 bool BoundaryInfo::operator==(const BoundaryInfo& other) const {
