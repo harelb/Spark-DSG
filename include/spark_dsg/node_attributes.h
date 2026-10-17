@@ -287,7 +287,6 @@ struct AgentNodeAttributes : public NodeAttributes {
   BowIdVector dbow_ids;
   Eigen::VectorXf dbow_values;
   std::vector<uint32_t> observed_semantic_labels;
-  std::string image_folder;
 
  protected:
   std::ostream& fill_ostream(std::ostream& out) const override;
@@ -328,9 +327,6 @@ struct KhronosObjectAttributes : public ObjectNodeAttributes {
 
   // Optionally store additional detailed infos if needed.
   std::map<std::string, std::vector<size_t>> details;
-
-  //! Folder holding the images associated with this object
-  std::string image_folder;
 
  protected:
   std::ostream& fill_ostream(std::ostream& out) const override;

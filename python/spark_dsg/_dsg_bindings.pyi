@@ -53,7 +53,6 @@ __all__: list[str] = [
 ]
 
 class AgentNodeAttributes(NodeAttributes):
-    image_folder: str
     timestamp: datetime.timedelta
     world_R_body: Quaternion
     def __init__(self) -> None: ...
@@ -303,7 +302,6 @@ class EdgeAttributes:
     def weight(self, arg0: typing.SupportsFloat | typing.SupportsIndex) -> None: ...
 
 class KhronosObjectAttributes(ObjectNodeAttributes):
-    image_folder: str
     def __init__(self) -> None: ...
     def mesh(self) -> Mesh: ...
     @property
