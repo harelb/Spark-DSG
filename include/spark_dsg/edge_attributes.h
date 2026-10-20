@@ -37,7 +37,7 @@
 #include <ostream>
 
 #include "spark_dsg/metadata.h"
-#include "spark_dsg/serialization/attribute_registry.h"
+#include "spark_dsg/serialization/registration_info.h"
 
 namespace spark_dsg {
 namespace serialization {
@@ -45,10 +45,6 @@ class Visitor;
 }
 
 struct EdgeAttributes;
-
-template <typename T>
-using EdgeAttributeRegistration =
-    serialization::AttributeRegistration<EdgeAttributes, T>;
 
 //! Collection of information for an edge
 struct EdgeAttributes {
@@ -97,8 +93,6 @@ struct EdgeAttributes {
   virtual void serialization_info() const;
 
   virtual bool is_equal(const EdgeAttributes& other) const;
-
-  static const EdgeAttributeRegistration<EdgeAttributes> registration_;
 
   virtual const serialization::RegistrationInfo& registrationImpl() const;
 };

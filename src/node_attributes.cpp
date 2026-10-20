@@ -36,41 +36,76 @@
 
 #include <numbers>
 
+#include "spark_dsg/serialization/attribute_registry.h"
 #include "spark_dsg/serialization/attribute_serialization.h"
 #include "spark_dsg/serialization/binary_conversions.h"
 #include "spark_dsg/serialization/json_conversions.h"
 #include "spark_dsg/serialization/versioning.h"
 
+namespace nlohmann {
+
+template <typename Rep, typename Period>
+struct adl_serializer<std::chrono::duration<Rep, Period>> {
+  static void to_json(json& j, const std::chrono::duration<Rep, Period>& duration) {
+    j = std::chrono::nanoseconds(duration).count();
+  }
+
+  static void from_json(const json& j, std::chrono::duration<Rep, Period>& duration) {
+    const auto stamp_ns = j.get<int64_t>();
+    duration = std::chrono::nanoseconds(stamp_ns);
+  }
+};
+
+}  // namespace nlohmann
+
 namespace spark_dsg {
 
-template <typename T>
-std::string showIterable(const T& iterable, size_t max_length = 80) {
-  std::stringstream ss;
-  ss << "[";
-  auto iter = iterable.begin();
-  while (iter != iterable.end()) {
-    ss << *iter;
+using serialization::RegistrationInfo;
+using NodeRegistry = serialization::AttributeRegistry<NodeAttributes>;
 
-    ++iter;
-    if (iter != iterable.end()) {
-      ss << ", ";
-    }
-
-    if (max_length && ss.str().size() >= max_length) {
-      ss << "...";
-      break;
-    }
-  }
-  ss << "]";
-
-  return ss.str();
+const RegistrationInfo& SemanticNodeAttributes::registrationImpl() const {
+  static const auto info = NodeRegistry::registration("SemanticNodeAttributes");
+  return info;
 }
 
-template <typename Scalar>
-std::string quatToString(const Eigen::Quaternion<Scalar>& q) {
-  std::stringstream ss;
-  ss << "{w: " << q.w() << ", " << q.x() << ", " << q.y() << ", " << q.z() << "}";
-  return ss.str();
+const RegistrationInfo& ObjectNodeAttributes::registrationImpl() const {
+  static const auto info = NodeRegistry::registration("ObjectNodeAttributes");
+  return info;
+}
+
+const RegistrationInfo& RoomNodeAttributes::registrationImpl() const {
+  static const auto info = NodeRegistry::registration("RoomNodeAttributes");
+  return info;
+}
+
+const RegistrationInfo& PlaceNodeAttributes::registrationImpl() const {
+  static const auto info = NodeRegistry::registration("PlaceNodeAttributes");
+  return info;
+}
+
+const RegistrationInfo& Place2dNodeAttributes::registrationImpl() const {
+  static const auto info = NodeRegistry::registration("Place2dNodeAttributes");
+  return info;
+}
+
+const RegistrationInfo& AgentNodeAttributes::registrationImpl() const {
+  static const auto info = NodeRegistry::registration("AgentNodeAttributes");
+  return info;
+}
+
+const RegistrationInfo& KhronosObjectAttributes::registrationImpl() const {
+  static const auto info = NodeRegistry::registration("KhronosObjectAttributes");
+  return info;
+}
+
+const RegistrationInfo& TraversabilityNodeAttributes::registrationImpl() const {
+  static const auto info = NodeRegistry::registration("TraversabilityNodeAttributes");
+  return info;
+}
+
+const RegistrationInfo& TravNodeAttributes::registrationImpl() const {
+  static const auto info = NodeRegistry::registration("TravNodeAttributes");
+  return info;
 }
 
 bool operator==(const NearestVertexInfo& lhs, const NearestVertexInfo& rhs) {
@@ -178,9 +213,11 @@ void ObjectNodeAttributes::transform(const Eigen::Isometry3d& transform) {
 
 std::ostream& ObjectNodeAttributes::fill_ostream(std::ostream& out) const {
   SemanticNodeAttributes::fill_ostream(out);
-  out << "\n  - mesh_connections: " << showIterable(mesh_connections);
+  out << "\n  - mesh_connections: " << mesh_connections.size();
   out << "\n  - registered?: " << (registered ? "yes" : "no");
-  out << "\n  - world_R_object: " << quatToString(world_R_object);
+  out << "\n  - world_R_object: " << "{w: " << world_R_object.w() << ", "
+      << world_R_object.x() << ", " << world_R_object.y() << ", " << world_R_object.z()
+      << "}";
   return out;
 }
 
@@ -413,7 +450,8 @@ void AgentNodeAttributes::transform(const Eigen::Isometry3d& transform) {
 
 std::ostream& AgentNodeAttributes::fill_ostream(std::ostream& out) const {
   NodeAttributes::fill_ostream(out);
-  out << "\n  - orientation: " << quatToString(world_R_body);
+  out << "\n  - orientation: " << "{w: " << world_R_body.w() << ", " << world_R_body.x()
+      << ", " << world_R_body.y() << ", " << world_R_body.z() << "}";
   out << "\n  - observed_semantic_labels.size(): " << observed_semantic_labels.size();
   return out;
 }

@@ -133,9 +133,7 @@ const Layer* SceneGraph::findLayer(const std::string& name) const {
 const Layer& SceneGraph::getLayer(LayerId layer_id, PartitionId partition) const {
   auto layer = findLayer(layer_id, partition);
   if (!layer) {
-    std::stringstream ss;
-    ss << "missing layer " << LayerKey{layer_id, partition};
-    throw std::out_of_range(ss.str());
+    throw std::out_of_range("missing layer " + LayerKey{layer_id, partition}.str());
   }
 
   return *layer;
@@ -342,9 +340,7 @@ const Node* SceneGraph::findNode(NodeId node_id) const {
 const Edge& SceneGraph::getEdge(NodeId source, NodeId target) const {
   const auto edge = findEdge(source, target);
   if (!edge) {
-    std::stringstream ss;
-    ss << "Missing edge '" << EdgeKey(source, target) << "'";
-    throw std::out_of_range(ss.str());
+    throw std::out_of_range("Missing edge '" + EdgeKey(source, target).str() + "'");
   }
 
   return *edge;
@@ -535,7 +531,7 @@ bool SceneGraph::updateFromLayer(const SceneGraphLayer& other_layer,
 bool SceneGraph::mergeGraph(const SceneGraph& other,
                             const GraphMergeConfig& config,
                             const Eigen::Isometry3d* transform_new_nodes) {
-  metadata.add(other.metadata());
+  metadata.add(other.metadata);
 
   other.visitLayers([&](LayerKey layer_key, const SceneGraphLayer& other_layer) {
     auto& layer = layerFromKey(layer_key);
@@ -681,14 +677,7 @@ void SceneGraph::transform(const Eigen::Isometry3d& transform) {
 }
 
 void SceneGraph::save(std::filesystem::path filepath, bool include_mesh) const {
-  const auto type = io::verifyFileExtension(filepath);
-  if (type == io::FileType::JSON) {
-    io::saveDsgJson(*this, filepath, include_mesh);
-    return;
-  }
-
-  // Can only be binary after verification.
-  io::saveDsgBinary(*this, filepath, include_mesh);
+  io::saveDsgToFile(*this, filepath, include_mesh);
 }
 
 SceneGraph::Ptr SceneGraph::load(std::filesystem::path filepath) {
