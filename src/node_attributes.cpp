@@ -428,7 +428,11 @@ bool Place2dNodeAttributes::is_equal(const NodeAttributes& other) const {
          has_active_mesh_indices == derived->has_active_mesh_indices;
 }
 
-AgentNodeAttributes::AgentNodeAttributes() : NodeAttributes(), timestamp(0) {}
+AgentNodeAttributes::AgentNodeAttributes()
+    : NodeAttributes(),
+      timestamp(0),
+      world_R_body(Eigen::Quaterniond::Identity()),
+      external_key(0) {}
 
 AgentNodeAttributes::AgentNodeAttributes(std::chrono::nanoseconds timestamp,
                                          const Eigen::Quaterniond& world_R_body,

@@ -58,4 +58,15 @@ TEST(NodeAttributes, SemanticNodeAttributes) {
   EXPECT_TRUE(attrs.hasFeature());
 }
 
+TEST(NodeAttributes, AgentNodeAttributesDefaults) {
+  // a default agent must not carry uninitialized memory: a NaN orientation is
+  // written to JSON as null, and the file then fails to load
+  AgentNodeAttributes attrs;
+  EXPECT_EQ(attrs.world_R_body.w(), 1.0);
+  EXPECT_EQ(attrs.world_R_body.x(), 0.0);
+  EXPECT_EQ(attrs.world_R_body.y(), 0.0);
+  EXPECT_EQ(attrs.world_R_body.z(), 0.0);
+  EXPECT_EQ(attrs.external_key, 0u);
+}
+
 }  // namespace spark_dsg
